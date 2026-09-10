@@ -104,6 +104,15 @@ Editing the script requires a bootout + bootstrap to take effect. Because
 
 ## Gotchas
 
+- **macOS can disable the event tap behind your back** — on callback timeout or
+  during secure input it stops delivering events *silently*: the process looks
+  healthy, idles at 0% CPU, and hears nothing until restarted. Symptom is
+  "it worked, then stopped", which is easy to misdiagnose as a broken key or
+  permission. The callback re-arms on `kCGEventTapDisabledByTimeout` /
+  `...ByUserInput`, and a 0.5s health-check timer (the same one that keeps
+  SIGINT alive) re-arms it if `CGEventTapIsEnabled` says otherwise. Both log
+  `! tap disabled — re-armed` so the next occurrence is visible instead of
+  silent.
 - **Never name a method of an `NSObject` subclass `release`** (or `press`). It
   shadows `-release`, and since `performSelectorOnMainThread:` retains/releases
   its receiver, the override re-enters itself forever: a permanent ~100% CPU

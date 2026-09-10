@@ -100,11 +100,21 @@ class MeterView(AppKit.NSView):
 
 
 class KeepAlive(AppKit.NSObject):
-    """Idle timer so Python bytecode keeps running — SIGINT is otherwise
-    deferred forever by the AppKit run loop, which makes Ctrl-C look dead."""
+    """Idle timer doing two jobs: keep Python bytecode running (SIGINT is
+    otherwise deferred forever by the AppKit run loop, which makes Ctrl-C look
+    dead), and health-check the event tap. macOS disables taps on callback
+    timeout or during secure input, which leaves this daemon looking perfectly
+    healthy while hearing nothing at all until it is restarted."""
+
+    def initWithCheck_(self, check):
+        self = objc.super(KeepAlive, self).init()
+        if self is None:
+            return None
+        self._check = check
+        return self
 
     def noop_(self, timer):
-        pass
+        self._check()
 
 
 class Overlay(AppKit.NSObject):
@@ -481,9 +491,6 @@ def main() -> None:
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: os._exit(0))
-    AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-        0.5, KeepAlive.alloc().init(), "noop:", None, True
-    )
     overlay = None if args.no_overlay else Overlay.alloc().initWithPrompt_(args.overlay_text)
     recorder = Recorder(model, args.context, args.live_file, args.dry_run, args.device, overlay, args.paste_delay)
     print(
@@ -502,6 +509,14 @@ def main() -> None:
 
     def callback(proxy, type_, event, refcon):
         nonlocal held
+        if type_ in (
+            Quartz.kCGEventTapDisabledByTimeout,
+            Quartz.kCGEventTapDisabledByUserInput,
+        ):
+            Quartz.CGEventTapEnable(tap, True)
+            held = False  # a disable can swallow the release
+            print(f"! tap disabled by system (0x{type_ & 0xffffffff:x}) — re-armed", flush=True)
+            return event
         code = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
         if code != keycode:
             return event
@@ -534,6 +549,19 @@ def main() -> None:
     source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
     Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source, Quartz.kCFRunLoopCommonModes)
     Quartz.CGEventTapEnable(tap, True)
+
+    def tap_healthy() -> None:
+        """Re-arm the tap if the system disabled it behind our back."""
+        nonlocal held
+        if Quartz.CGEventTapIsEnabled(tap):
+            return
+        Quartz.CGEventTapEnable(tap, True)
+        held = False
+        print("! tap found disabled — re-armed", flush=True)
+
+    AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        0.5, KeepAlive.alloc().initWithCheck_(tap_healthy), "noop:", None, True
+    )
     app.run()
 
 
