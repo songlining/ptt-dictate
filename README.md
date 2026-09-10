@@ -5,16 +5,29 @@ local replacement for a pre-existing dictation app's push-to-talk, with the same
 the model transcribes as you speak, release and the text lands in whatever app
 has focus.
 
-One warm daemon, no cloud round-trip, ~0.3s from key release to pasted text.
+One warm daemon, no cloud round-trip, ~0.3s from key release to pasted text,
+plus a floating status pill while you speak.
 
 ## How it works
 
 - A Quartz **listen-only** event tap watches one hotkey (no keystroke swallowed).
 - On press: mic → 2.93s streaming steps into a model that stays resident, live
-  partials printed as they land.
+  partials printed as they land and shown in the status pill.
 - On release: one padded flush step on the tail (~0.3s), then the text is put
   on the clipboard, Cmd-V is posted, and the previous clipboard is restored.
   Clipboard-based because CGEvent keyboard injection cannot type Chinese.
+
+### The status pill
+
+A borderless, non-activating `NSPanel`: dark rounded pill, bottom centre,
+showing the prompt text until speech arrives, then the tail of the live
+partial, with a 5-bar mic meter on the right (silence = flat dots, normal
+speech = bars at ~80%). Click-through, above normal windows, and never takes
+focus from the app you are dictating into.
+
+The process runs as an **accessory** app (no Dock icon, never activated) — so
+the panel needs `setHidesOnDeactivate_(False)` or it flashes on press and
+vanishes, which is exactly what the default NSPanel behaviour does here.
 
 ## Requirements
 
@@ -46,7 +59,9 @@ Then hold the key, speak, release.
 | `--tail-ms` | `200` | extra mic time after release, to catch the last syllable |
 | `--device` | system default | input device index or name |
 | `--dry-run` | off | print the text instead of pasting it |
-| `--self-test` | — | window bookkeeping + text cleaning, no model load |
+| `--no-overlay` | off | no status pill (headless / scripted use) |
+| `--overlay-text` | `直接说` | pill text while waiting for speech |
+| `--self-test` | — | window bookkeeping, text cleaning, meter curve — no model load |
 
 Run it attended first (`--dry-run`) to confirm the hotkey and the transcript
 before letting it paste into live apps.
@@ -60,6 +75,7 @@ before letting it paste into live apps.
 | cost per step | ~0.3s (file-direct, 3-chunk clip in 1.01s total) |
 | model load | ~0.8s from disk (the daemon keeps it resident) |
 | first partial | after ~3.5s of speech |
+| mic RMS | silence ~0.001, speech p90 ~0.06 |
 
 Text handling: the model prefixes chunks with `Speaker 0:` and emits
 `[Silence]`/`[Noise]` markers — both are stripped, and nothing is pasted when
@@ -83,9 +99,11 @@ boundaries, light punctuation).
 - **The window protocol matters**: window k must cover `[k*ADV, k*ADV+WIN)`.
   Feeding a wider overlap makes the model re-transcribe audio it already
   emitted — that bug is what the `feed`/`flush` split and the self-test guard.
+- **Ctrl-C quits** — via a 0.5s idle timer, because the AppKit run loop would
+  otherwise defer the signal forever and the daemon would look unkillable.
+- **The pill is fixed-size** (380×44pt) and truncates long text from the left
+  (`…` prefix) — the most recent words are the ones worth showing.
 
 ## Not implemented
 
-- On-screen "listening" pill (a pre-existing dictation app's floating UI) — live partials go to the
-  terminal / `--live-file` instead
 - Autostart at login (a LaunchAgent + a 2.8GB resident model)

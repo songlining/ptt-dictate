@@ -14,14 +14,17 @@ this (TCC prompts on first use). a pre-existing dictation app must not hold the 
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 
 import numpy as np
+import objc
 import Quartz
 import AppKit
 import sounddevice as sd
@@ -46,11 +49,161 @@ PLAIN_KEYS = {"f13": 105, "f14": 107, "f15": 113, "f16": 106, "f17": 64, "f18": 
 
 NOISE = re.compile(r"\[(?:silence|noise|music|applause|laughter|inaudible)\]", re.I)
 SPEAKER = re.compile(r"\s*speaker\s*\d+\s*:\s*", re.I)
+METER_BARS = 5
 
 
 def clean(text: str) -> str:
     """Strip the model's `Speaker 0:` prefix and `[Silence]`-style markers."""
     return re.sub(r"\s+", " ", NOISE.sub(" ", SPEAKER.sub(" ", text))).strip()
+
+
+def ellipsize(text: str, limit: int = 40) -> str:
+    """Keep the tail — the most recent words are what matters while dictating."""
+    text = text.strip()
+    return text if len(text) <= limit else "…" + text[-limit:]
+
+
+def meter_level(rms: float) -> float:
+    """Map mic RMS to 0..1 bar height. Square-root curve: speech RMS sits
+    around 0.01-0.1, so a linear scale leaves the bars flat at normal volume."""
+    return min(1.0, max(0.0, rms) ** 0.5 * 3.2)
+
+
+class MeterView(AppKit.NSView):
+    """Rolling mic level as a row of bars — the pill's 'is it hearing me'."""
+
+    def initWithFrame_(self, rect):
+        self = objc.super(MeterView, self).initWithFrame_(rect)
+        if self is None:
+            return None
+        self.bars = [0.0] * METER_BARS
+        return self
+
+    def setBars_(self, bars):
+        self.bars = bars
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, rect):
+        AppKit.NSColor.whiteColor().set()
+        width, height = self.bounds().size.width, self.bounds().size.height
+        bar, gap = 2.0, 2.5
+        for i, level in enumerate(self.bars):
+            x = i * (bar + gap)
+            if x + bar > width:
+                break
+            h = max(2.0, height * min(1.0, level))
+            AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                AppKit.NSMakeRect(x, (height - h) / 2.0, bar, h), 1.0, 1.0
+            ).fill()
+
+
+class KeepAlive(AppKit.NSObject):
+    """Idle timer so Python bytecode keeps running — SIGINT is otherwise
+    deferred forever by the AppKit run loop, which makes Ctrl-C look dead."""
+
+    def noop_(self, timer):
+        pass
+
+
+class Overlay(AppKit.NSObject):
+    """Floating status pill: prompt, live partial text, mic meter."""
+
+    W, H = 380.0, 44.0
+
+    def initWithPrompt_(self, prompt):
+        self = objc.super(Overlay, self).init()
+        if self is None:
+            return None
+        self.prompt = prompt
+        self.recorder = None
+        self.timer = None
+        self._build()
+        return self
+
+    def _build(self):
+        frame = AppKit.NSScreen.mainScreen().visibleFrame()
+        rect = AppKit.NSMakeRect(
+            frame.origin.x + (frame.size.width - self.W) / 2.0,
+            frame.origin.y + 150.0,
+            self.W,
+            self.H,
+        )
+        panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect,
+            AppKit.NSWindowStyleMaskBorderless | AppKit.NSWindowStyleMaskNonactivatingPanel,
+            AppKit.NSBackingStoreBuffered,
+            False,
+        )
+        panel.setLevel_(AppKit.NSFloatingWindowLevel)
+        panel.setFloatingPanel_(True)
+        panel.setBecomesKeyOnlyIfNeeded_(True)  # never steal focus from the target app
+        # An accessory app never activates, and NSPanel hides on deactivate by
+        # default — without this the pill flashes on press and vanishes.
+        panel.setHidesOnDeactivate_(False)
+        panel.setOpaque_(False)
+        panel.setBackgroundColor_(AppKit.NSColor.clearColor())
+        panel.setHasShadow_(True)
+        panel.setIgnoresMouseEvents_(True)
+        panel.setCollectionBehavior_(
+            AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+            | AppKit.NSWindowCollectionBehaviorStationary
+            | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+        content = panel.contentView()
+        content.setWantsLayer_(True)
+        content.layer().setBackgroundColor_(
+            AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.06, 0.88).CGColor()
+        )
+        content.layer().setCornerRadius_(self.H / 2.0)
+        content.layer().setMasksToBounds_(True)
+
+        label = AppKit.NSTextField.alloc().initWithFrame_(
+            AppKit.NSMakeRect(20.0, (self.H - 20.0) / 2.0, self.W - 88.0, 20.0)
+        )
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        label.setFont_(AppKit.NSFont.systemFontOfSize_(14.0))
+        label.setTextColor_(AppKit.NSColor.whiteColor())
+        label.setStringValue_(self.prompt)
+        content.addSubview_(label)
+
+        meter = MeterView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(self.W - 40.0, (self.H - 16.0) / 2.0, 20.0, 16.0)
+        )
+        content.addSubview_(meter)
+        self.panel, self.label, self.meter = panel, label, meter
+
+    def press(self) -> None:
+        self.label.setStringValue_(self.prompt)
+        self.meter.setBars_([0.0] * METER_BARS)
+        self.panel.orderFrontRegardless()
+        if self.timer is not None:  # don't stack timers across rapid presses
+            self.timer.invalidate()
+        self.timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.06, self, "tick:", None, True
+        )
+
+    def release(self) -> None:
+        """Called from the recorder thread — hop to the main thread for AppKit."""
+        self.performSelectorOnMainThread_withObject_waitUntilDone_("doRelease:", None, False)
+
+    def doRelease_(self, _):
+        # A queued release can land after a newer press — never hide a live one.
+        if self.recorder is not None and getattr(self.recorder, "active", False):
+            return
+        if self.timer is not None:
+            self.timer.invalidate()
+            self.timer = None
+        self.panel.orderOut_(None)
+
+    def tick_(self, _):
+        recorder = self.recorder
+        level = meter_level(getattr(recorder, "level", 0.0))
+        self.meter.setBars_(self.meter.bars[1:] + [level])
+        text = getattr(recorder, "text_so_far", "")
+        self.label.setStringValue_(ellipsize(text or self.prompt))
 
 
 def paste(text: str) -> None:
@@ -73,12 +226,15 @@ def paste(text: str) -> None:
 class Recorder:
     """One press-to-release dictation cycle against a loaded streaming model."""
 
-    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None):
+    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None):
         self.model = model
         self.context = context
         self.live_file = live_file
         self.dry_run = dry_run
         self.device = device
+        self.overlay = overlay
+        if overlay is not None:
+            overlay.recorder = self
         self.SR = model.sample_rate
         self.WIN = model.streaming_window_samples
         self.ADV = model.streaming_chunk_samples
@@ -91,6 +247,8 @@ class Recorder:
         self.buf = np.zeros(0, dtype=np.float32)
         self.steps = 0
         self.parts: list[str] = []
+        self.text_so_far = ""
+        self.level = 0.0
         self.state = None
         self.stop = threading.Event()
 
@@ -121,10 +279,15 @@ class Recorder:
         piece = clean(text)
         if piece:
             self.parts.append(piece)
+            self.text_so_far = " ".join(self.parts)
             print(f"  {piece}", flush=True)
             if self.live_file:
                 with open(self.live_file, "a") as fh:
                     fh.write(piece + "\n")
+
+    def _on_audio(self, data, frames, time_info, status) -> None:
+        self.level = float(np.sqrt(np.mean(np.square(data))))
+        self.q.put(bytes(data))
 
     def press(self) -> None:
         with self.lock:
@@ -145,9 +308,11 @@ class Recorder:
             samplerate=self.SR,
             channels=1,
             dtype="float32",
-            callback=lambda data, frames, t, status: self.q.put(bytes(data)),
+            callback=self._on_audio,
         )
         self.stream.start()
+        if self.overlay is not None:
+            self.overlay.press()
         print("● listening", flush=True)
 
     def release(self, tail_ms: int = 200) -> None:
@@ -172,6 +337,8 @@ class Recorder:
         except Exception as exc:  # keep the daemon alive through a bad cycle
             print(f"release failed: {exc!r}", flush=True)
         finally:
+            if self.overlay is not None:
+                self.overlay.release()
             with self.lock:
                 self.busy = False
 
@@ -218,6 +385,9 @@ def self_test() -> None:
     assert clean("Speaker 0:Hello Speaker 1:world") == "Hello world"
     assert clean("[Silence]") == ""
     assert clean("[Noise] [Silence]") == ""
+    assert meter_level(0.0) == 0.0
+    assert 0.3 < meter_level(0.02) < 0.7, meter_level(0.02)  # quiet speech still moves
+    assert meter_level(0.5) == 1.0  # clamped, never overflows the bar
 
     rec = Recorder(_FakeModel(), dry_run=True)
     rec.reset()
@@ -253,6 +423,8 @@ def main() -> None:
     ap.add_argument("--tail-ms", type=int, default=200, help="extra mic time after key release")
     ap.add_argument("--device", default=None, help="input device index/name (default: system default)")
     ap.add_argument("--dry-run", action="store_true", help="print instead of pasting")
+    ap.add_argument("--no-overlay", action="store_true", help="skip the floating status pill")
+    ap.add_argument("--overlay-text", default="直接说", help="pill text while waiting for speech")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
@@ -278,7 +450,17 @@ def main() -> None:
     model = load(args.model)
     if not model.is_streaming_model:
         sys.exit("not a streaming checkpoint")
-    recorder = Recorder(model, args.context, args.live_file, args.dry_run, args.device)
+
+    # Accessory app: needed for the panel, but no Dock icon and never activated.
+    app = AppKit.NSApplication.sharedApplication()
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: os._exit(0))
+    AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        0.5, KeepAlive.alloc().init(), "noop:", None, True
+    )
+    overlay = None if args.no_overlay else Overlay.alloc().initWithPrompt_(args.overlay_text)
+    recorder = Recorder(model, args.context, args.live_file, args.dry_run, args.device, overlay)
     print(
         f"ready: {args.key} (keycode {keycode}) | {model.sample_rate}Hz "
         f"window {model.streaming_window_samples / model.sample_rate:.2f}s "
@@ -327,10 +509,7 @@ def main() -> None:
     source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
     Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source, Quartz.kCFRunLoopCommonModes)
     Quartz.CGEventTapEnable(tap, True)
-    try:
-        Quartz.CFRunLoopRun()
-    except KeyboardInterrupt:
-        print("\nbye")
+    app.run()
 
 
 if __name__ == "__main__":
