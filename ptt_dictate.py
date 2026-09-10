@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import inspect
 import os
 import queue
 import re
@@ -34,7 +35,7 @@ import sounddevice as sd
 import mlx.core as mx
 from mlx_audio.stt import load
 
-DEFAULT_MODEL = str(Path.home() / "models/vibevoice-asr-streaming-1.5b-mlx-8bit")
+DEFAULT_MODEL = "mlx-community/Qwen3-ASR-1.7B-8bit"
 
 # keycode -> (modifier flag mask or None for a normal key)
 MODIFIERS = {
@@ -70,6 +71,53 @@ def meter_level(rms: float) -> float:
     """Map mic RMS to 0..1 bar height. Square-root curve: speech RMS sits
     around 0.01-0.1, so a linear scale leaves the bars flat at normal volume."""
     return min(1.0, max(0.0, rms) ** 0.5 * 3.2)
+
+
+def result_text(out) -> str:
+    """Text out of an mlx_audio STTOutput.
+
+    STTOutput is attribute-only (not subscriptable), and the empty result is a
+    real case — silence returns '' — so the obvious `or out["text"]` fallback
+    raises TypeError exactly when there is nothing to say.
+    """
+    text = getattr(out, "text", None)
+    if text is None:
+        try:
+            text = out["text"]
+        except Exception:
+            text = ""
+    return text or ""
+
+
+def peak_level(buf: np.ndarray, sr: int, block: float = 0.1) -> float:
+    """Loudest 100ms-block RMS. Distinguishes "someone spoke" from room tone:
+    a whole-capture average is dragged down by silence around the words, and on
+    a quiet headset it sits below the room-tone floor of the loud parts."""
+    n = max(1, int(sr * block))
+    if buf.size < n:
+        return float(np.sqrt(np.mean(np.square(buf)))) if buf.size else 0.0
+    usable = buf[: buf.size - (buf.size % n)].reshape(-1, n)
+    return float(np.sqrt(np.mean(np.square(usable), axis=1)).max())
+
+
+def silence_reason(buf: np.ndarray, sr: int, min_rms: float) -> str | None:
+    """Why this capture should not be transcribed, or None if it should be.
+
+    Not a hallucination guard: measured, Qwen3-ASR returns '' for digital
+    silence *and* for room tone, so it invents nothing on a stray tap. This is
+    a cheap guard that skips the model run on a mis-tap and — more usefully —
+    distinguishes a muted or disconnected mic from "the model heard nothing",
+    which is otherwise indistinguishable in the log. The threshold is therefore
+    deliberately low: room tone on a quiet headset peaks around 0.0006-0.006,
+    so anything higher risks silently dropping a quietly-spoken word.
+    (Whisper-class models *do* hallucinate on silence, hence keeping any gate.)
+    """
+    if buf.size < sr * 0.3:
+        return f"only {buf.size / sr:.2f}s of audio"
+    peak = peak_level(buf, sr)
+    if peak < min_rms:
+        return f"too quiet (peak {peak:.4f} < {min_rms}) — mic muted?"
+    return None
 
 
 class MeterView(AppKit.NSView):
@@ -250,9 +298,9 @@ def paste(text: str, restore_delay: float = 0.6) -> None:
 
 
 class Recorder:
-    """One press-to-release dictation cycle against a loaded streaming model."""
+    """One press-to-release dictation cycle against a loaded ASR model."""
 
-    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6):
+    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6, batch: bool = False, min_rms: float = 0.005):
         self.model = model
         self.context = context
         self.live_file = live_file
@@ -260,12 +308,15 @@ class Recorder:
         self.device = device
         self.overlay = overlay
         self.paste_delay = paste_delay
+        self.batch = batch
+        self.min_rms = min_rms
         self.last_device = None
         if overlay is not None:
             overlay.recorder = self
         self.SR = model.sample_rate
-        self.WIN = model.streaming_window_samples
-        self.ADV = model.streaming_chunk_samples
+        # The streaming protocol's geometry only exists on streaming checkpoints.
+        self.WIN = 0 if batch else model.streaming_window_samples
+        self.ADV = 0 if batch else model.streaming_chunk_samples
         self.lock = threading.Lock()
         self.active = False
         self.busy = False
@@ -288,14 +339,40 @@ class Recorder:
         the next. Feeding a wider overlap makes the model re-transcribe it.
         """
         self.buf = np.concatenate([self.buf, chunk])
+        if self.batch:
+            return  # one pass over the whole press, at release
         while self.buf.size >= self.WIN:
             self._step()
             self.buf = self.buf[self.ADV :]
 
     def flush(self) -> None:
-        """Final step on the tail, right-padded — same as pad_last_chunk."""
-        if self.buf.size >= self.SR // 10:
+        """Streaming: final padded step on the tail. Batch: transcribe it all."""
+        if self.batch:
+            self._transcribe()
+        elif self.buf.size >= self.SR // 10:
             self._step()
+
+    def _bias_kwargs(self) -> dict:
+        """--context as real hotwords, when the model takes them (Qwen3-ASR does)."""
+        words = [w.strip() for w in self.context.split(",") if w.strip()]
+        if words and "hotwords" in inspect.signature(self.model.generate).parameters:
+            return {"hotwords": words}
+        return {}
+
+    def _transcribe(self) -> None:
+        reason = silence_reason(self.buf, self.SR, self.min_rms)
+        if reason is not None:
+            print(f"  (skipped: {reason})", flush=True)
+            return
+        out = self.model.generate(self.buf, **self._bias_kwargs())
+        piece = clean(result_text(out))
+        if piece:
+            self.parts.append(piece)
+            self.text_so_far = piece
+            print(f"  {piece}", flush=True)
+            if self.live_file:
+                with open(self.live_file, "a") as fh:
+                    fh.write(piece + "\n")
 
     def _step(self) -> None:
         window = self.buf[: self.WIN]
@@ -360,11 +437,15 @@ class Recorder:
                 return
             self.active = True
         self.reset()
-        self.state = (
-            self.model.init_streaming_state(context_info=self.context)
-            if self.context
-            else self.model.init_streaming_state()
-        )
+        # Batch models have no streaming state to prefill (nor init_streaming_state).
+        if self.batch:
+            self.state = None
+        else:
+            self.state = (
+                self.model.init_streaming_state(context_info=self.context)
+                if self.context
+                else self.model.init_streaming_state()
+            )
         self.q: queue.Queue = queue.Queue()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -453,6 +534,13 @@ def self_test() -> None:
     assert clean("Speaker 0:Hello Speaker 1:world") == "Hello world"
     assert clean("[Silence]") == ""
     assert clean("[Noise] [Silence]") == ""
+    # the gate that stops a stray tap pasting invented words
+    assert silence_reason(np.zeros(16000, dtype=np.float32), 16000, 0.002) is not None  # silence
+    assert silence_reason(np.zeros(4000, dtype=np.float32), 16000, 0.002) is not None   # too short
+    assert silence_reason(np.full(16000, 0.05, dtype=np.float32), 16000, 0.002) is None  # speech
+    # room tone with one brief word in it must pass (peak, not average)
+    quiet = np.full(16000, 0.0009, dtype=np.float32); quiet[8000:8800] = 0.02
+    assert silence_reason(quiet, 16000, 0.002) is None, "a quiet short word was dropped"
     assert meter_level(0.0) == 0.0
     assert 0.3 < meter_level(0.02) < 0.7, meter_level(0.02)  # quiet speech still moves
     assert meter_level(0.5) == 1.0  # clamped, never overflows the bar
@@ -486,7 +574,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--key", default="right_option", help=f"{', '.join(MODIFIERS)} or f13..f19")
-    ap.add_argument("--context", default="", help="hotwords / names fed to the model")
+    ap.add_argument("--context", default="", help="names/jargon; real hotwords in batch mode")
+    ap.add_argument("--mode", choices=("auto", "stream", "batch"), default="auto",
+                    help="auto: streaming checkpoints stream, everything else batches")
+    ap.add_argument("--min-rms", type=float, default=0.002,
+                    help="batch: skip captures whose loudest 100ms is below this"
+                         " (catches a muted mic; deliberately low)")
+    ap.add_argument("--transcribe-file", default="", help="transcribe a file and exit (smoke test)")
     ap.add_argument("--live-file", default="", help="append live partials to this file")
     ap.add_argument("--tail-ms", type=int, default=200, help="extra mic time after key release")
     ap.add_argument("--device", default=None, help="input device index/name (default: system default)")
@@ -503,11 +597,14 @@ def main() -> None:
 
     # Two daemons on the same key both paste — and the LaunchAgent keeps one
     # running. flock is released by the kernel on exit, so no stale pidfile.
-    lock = open(os.path.join(tempfile.gettempdir(), "ptt-dictate.lock"), "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        sys.exit("another ptt_dictate is already running (launchctl bootout local.ptt-dictate)")
+    # --transcribe-file is a diagnostic: it owns no hotkey, so it may run
+    # alongside the daemon.
+    if not args.transcribe_file:
+        lock = open(os.path.join(tempfile.gettempdir(), "ptt-dictate.lock"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            sys.exit("another ptt_dictate is already running (launchctl bootout local.ptt-dictate)")
 
     if args.device and args.device.isdigit():
         args.device = int(args.device)
@@ -520,8 +617,14 @@ def main() -> None:
 
     print(f"loading {args.model} ...", flush=True)
     model = load(args.model)
-    if not model.is_streaming_model:
-        sys.exit("not a streaming checkpoint")
+    batch = args.mode == "batch" or (
+        args.mode == "auto" and not getattr(model, "is_streaming_model", False)
+    )
+    if args.mode == "stream" and not getattr(model, "is_streaming_model", False):
+        sys.exit(f"{args.model} is not a streaming checkpoint (no window/chunk metadata)")
+    if args.transcribe_file:
+        print(result_text(model.generate(args.transcribe_file)))
+        return
     try:
         dev = sd.query_devices(args.device if args.device is not None else sd.default.device[0])
         print(
@@ -538,12 +641,21 @@ def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: os._exit(0))
     overlay = None if args.no_overlay else Overlay.alloc().initWithPrompt_(args.overlay_text)
-    recorder = Recorder(model, args.context, args.live_file, args.dry_run, args.device, overlay, args.paste_delay)
-    print(
-        f"ready: {args.key} (keycode {keycode}) | {model.sample_rate}Hz "
-        f"window {model.streaming_window_samples / model.sample_rate:.2f}s "
-        f"advance {model.streaming_chunk_samples / model.sample_rate:.2f}s"
-    )
+    recorder = Recorder(model, args.context, args.live_file, args.dry_run, args.device, overlay,
+                        args.paste_delay, batch, args.min_rms)
+    if batch:
+        print(
+            f"ready: {args.key} (keycode {keycode}) | BATCH | {recorder.SR}Hz input"
+            f" | transcribes on release",
+            flush=True,
+        )
+    else:
+        print(
+            f"ready: {args.key} (keycode {keycode}) | streaming | {model.sample_rate}Hz "
+            f"window {model.streaming_window_samples / model.sample_rate:.2f}s "
+            f"advance {model.streaming_chunk_samples / model.sample_rate:.2f}s",
+            flush=True,
+        )
     print(">>> HOLD the key to dictate, release to paste <<<", flush=True)
 
     mask = (

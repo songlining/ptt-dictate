@@ -52,7 +52,23 @@ mkdir -p "$(dirname "$LOG")"
 
 plutil -lint "$PLIST" >/dev/null
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+
+# bootout is asynchronous, and bootstrapping the label too soon fails with
+# "Bootstrap failed: 5: Input/output error" — which leaves dictation down.
+# Retry until launchd has actually let go of the label.
+booted=
+for _ in $(seq 10); do
+  if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
+    booted=yes
+    break
+  fi
+  sleep 1
+done
+if [[ -z "$booted" ]]; then
+  echo "launchctl bootstrap failed 10x — is the label stuck?" >&2
+  echo "try: launchctl bootout gui/$(id -u)/$LABEL && launchctl bootstrap gui/$(id -u) $PLIST" >&2
+  exit 1
+fi
 
 echo "installed $LABEL"
 echo "  plist: $PLIST"

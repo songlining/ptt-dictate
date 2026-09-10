@@ -1,28 +1,42 @@
 # ptt-dictate
 
-Hold-to-talk dictation on a local VibeVoice-ASR-Streaming model (MLX 8-bit) —
-hold the key, the model transcribes as you speak, release and the text lands in
-whatever app has focus.
+Hold-to-talk dictation on a local ASR model via MLX — hold the key, speak,
+release, and the text lands in whatever app has focus.
 
-One warm daemon, no cloud round-trip, ~0.3s from key release to pasted text,
-plus a floating status pill while you speak.
+One warm daemon, no cloud round-trip, ~0.3–0.5s from key release to pasted
+text, plus a floating status pill while you speak.
+
+Default model is **Qwen3-ASR-1.7B** (8-bit MLX) in **batch** mode: the whole
+utterance is transcribed once on release. That is both more accurate and faster
+than a streaming model for push-to-talk, because nothing has to wait for a
+fixed audio window to fill. **Streaming** models (VibeVoice-ASR-Streaming) are
+still supported via `--mode stream` — they trade accuracy for live partial text
+in the pill, at the cost of a hard 3.5s floor before any text can appear.
 
 ## How it works
 
 - A Quartz **listen-only** event tap watches one hotkey (no keystroke swallowed).
-- On press: mic → 2.93s streaming steps into a model that stays resident, live
-  partials printed as they land and shown in the status pill.
-- On release: one padded flush step on the tail (~0.3s), then the text is put
-  on the clipboard, Cmd-V is posted, and the previous clipboard is restored.
-  Clipboard-based because CGEvent keyboard injection cannot type Chinese.
+- On press: the mic stream opens on the *current* default input device and audio
+  is buffered; the pill appears with a live mic meter.
+- On release, either
+  - **batch** (default): one `model.generate()` call over the buffered utterance
+    (~0.3–0.5s for a 10s clip), or
+  - **streaming** (`--mode stream`): a final padded step on the tail, with
+    partials printed/shown as 2.93s windows land while you speak.
+- The text is then put on the clipboard, Cmd-V is posted, and the previous
+  clipboard is restored. Clipboard-based because CGEvent keyboard injection
+  cannot type Chinese.
 
 ### The status pill
 
 A borderless, non-activating `NSPanel`: dark rounded pill, bottom centre,
-showing the prompt text until speech arrives, then the tail of the live
+showing the prompt text, then (streaming mode only) the tail of the live
 partial, with a 5-bar mic meter on the right (silence = flat dots, normal
 speech = bars at ~80%). Click-through, above normal windows, and never takes
 focus from the app you are dictating into.
+
+In batch mode there is no partial text to show — the model only runs on release
+— so the pill is a listening indicator plus the meter.
 
 The process runs as an **accessory** app (no Dock icon, never activated) — so
 the panel needs `setHidesOnDeactivate_(False)` or it flashes on press and
@@ -39,9 +53,10 @@ vanishes, which is exactly what the default NSPanel behaviour does here.
   ```
 
   (Swap in any interpreter; point `PTT_PYTHON` at it for `install.sh`.)
-- **Model**: a VibeVoice ASR **streaming** checkpoint in MLX form (the local
-  8-bit conversion used here is 2.8GB). `--model` takes a path or any HF repo id
-  that mlx-audio can load as `vibevoice_asr`.
+- **Model**: any checkpoint `mlx-audio` can load. Default is
+  `mlx-community/Qwen3-ASR-1.7B-8bit` (2.3GB, auto-downloaded on first run);
+  streaming checkpoints (e.g. a VibeVoice-ASR-Streaming 8-bit MLX conversion)
+  work too and are auto-detected. `--model` takes a path or an HF repo id.
 - **Permissions**: Accessibility + Microphone for the interpreter (TCC prompts
   on first use).
 
@@ -60,8 +75,11 @@ Then hold the key, speak, release.
 | flag | default | notes |
 |------|---------|-------|
 | `--key` | `right_option` | `left_option`, `right_command`, `left_command`, `right_shift`, `left_shift`, `right_control`, `left_control`, `fn`, or `f13`–`f19` |
-| `--model` | 1.5B streaming | path to any streaming checkpoint |
-| `--context` | `""` | hotwords/names, e.g. `"Kubernetes, Postgres, Terraform"` — your own name, colleagues and customer names are the useful ones |
+| `--model` | `mlx-community/Qwen3-ASR-1.7B-8bit` | path or HF repo id; streaming checkpoints auto-switch to `--mode stream` |
+| `--mode` | `auto` | `auto` \| `stream` \| `batch`. `auto` streams only for checkpoints with window/chunk metadata |
+| `--context` | `""` | names/jargon. In batch mode these become **real hotwords** (`hotwords=[...]`) when the model supports it — your own name, colleagues and customer names are the useful ones |
+| `--min-rms` | `0.002` | batch: skip a capture whose loudest 100ms is below this. Catches a muted mic; deliberately low so a quietly-spoken word is never dropped |
+| `--transcribe-file` | `""` | transcribe a file and exit — smoke test, needs no hotkey and may run alongside the daemon |
 | `--live-file` | `""` | append live partials to a file |
 | `--tail-ms` | `200` | extra mic time after release, to catch the last syllable |
 | `--device` | system default | input device index or name |
@@ -74,24 +92,37 @@ Then hold the key, speak, release.
 Run it attended first (`--dry-run`) to confirm the hotkey and the transcript
 before letting it paste into live apps.
 
-## Runtime facts (measured, 1.5B 8-bit)
+## Runtime facts (measured on an M4 Pro, 8-bit MLX, 20s/10s clips)
 
-| | |
-|---|---|
-| sample rate | 24 kHz |
-| window / advance | 3.47s / 2.93s (chunk 22 frames + 4 lookahead, ratio 3200) |
-| cost per step | ~0.3s (file-direct, 3-chunk clip in 1.01s total) |
-| model load | ~0.8s from disk (the daemon keeps it resident) |
-| first partial | after ~3.5s of speech |
-| mic RMS | silence ~0.001, speech p90 ~0.06 |
-| idle CPU | 0.0% (the pill costs ~5% while it is on screen) |
+| | Qwen3-ASR 1.7B *(default)* | Qwen3-ASR 0.6B | VibeVoice-Stream 1.5B | VibeVoice-Stream 7B |
+|---|---|---|---|---|
+| resident memory | 2.50GB | 1.09GB | 3.07GB | 7.57GB |
+| 10.3s Chinese | **0.46s** (22×) | 0.24s (44×) | 1.23s (8×) | 2.54s (4×) |
+| 20s English | 0.96s (21×) | 0.47s (42×) | 2.23s (9×) | 4.98s (4×) |
+| 5s utterance, warm | 0.31s | 0.15s | 0.72s | 2.49s |
+| live partials | no | no | yes (from ~3.5s) | yes |
+| input rate | 16 kHz | 16 kHz | 24 kHz | 24 kHz |
 
-Text handling: the model prefixes chunks with `Speaker 0:` and emits
-`[Silence]`/`[Noise]` markers — both are stripped, and nothing is pasted when
-the result is empty.
+Accuracy on the same audio: Qwen 1.7B got every technical term right
+(`Terraform`, `Vault`, `dynamic secrets`, `Kubernetes`); the streaming 1.5B
+produced `MakeSecrets` and `UberNitz`, and heard "parameter" as "Perimeter".
+The 0.6B is 2× faster and 4× smaller but mis-spells the same vocabulary
+(`Teraform`, `Volt`), so 1.7B is the default. These are clean TTS clips, which
+flatter every model — treat the ranking as meaningful, the absolute scores as not.
 
-Streaming output is content-accurate but not verbatim (chunk-granular
-boundaries, light punctuation).
+**Warmup caveat:** the *first* inference after the daemon starts costs an extra
+~1–2s (MLX compiles Metal kernels). It is paid once per process, not per press —
+measured first-step times across three consecutive presses were 0.36/0.36/0.38s
+(1.5B) and 0.88/0.88/1.00s (7B).
+
+On silence: Qwen3-ASR returns an empty string for both digital silence and room
+tone, so it invents nothing on a stray tap. Whisper-class models do hallucinate,
+which is why the cheap `--min-rms` gate exists.
+
+Text handling: the streaming models prefix chunks with `Speaker 0:` and emit
+`[Silence]`/`[Noise]` markers — both are stripped, and nothing is pasted when the
+result is empty. Streaming output is content-accurate but not verbatim
+(chunk-granular boundaries, light punctuation).
 
 ## Install as a login daemon
 
