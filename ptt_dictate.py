@@ -5,10 +5,11 @@ Hold the hotkey: the mic streams into a warm model, live partials print as they
 land. Release: one final flush step (~0.3s), then the text is pasted into
 whatever app has focus (clipboard + Cmd-V, so Chinese works).
 
-    ~/venv/bin/python ~/ptt-dictate/ptt_dictate.py --key right_option
+    /path/to/venv/bin/python /path/to/ptt-dictate/ptt_dictate.py --key right_option
 
 One-time setup: grant Accessibility + Microphone to the interpreter running
-this (TCC prompts on first use). a pre-existing dictation app must not hold the same key.
+this (TCC prompts on first use), and make sure no other app is holding the
+same hotkey.
 """
 
 from __future__ import annotations
@@ -19,11 +20,11 @@ import os
 import queue
 import re
 import signal
-import subprocess
 import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import objc
@@ -33,7 +34,7 @@ import sounddevice as sd
 import mlx.core as mx
 from mlx_audio.stt import load
 
-DEFAULT_MODEL = "~/models/vibevoice-asr-streaming-1.5b-mlx-8bit"
+DEFAULT_MODEL = str(Path.home() / "models/vibevoice-asr-streaming-1.5b-mlx-8bit")
 
 # keycode -> (modifier flag mask or None for a normal key)
 MODIFIERS = {
@@ -516,11 +517,6 @@ def main() -> None:
         keycode, flag = PLAIN_KEYS[args.key], None
     else:
         sys.exit(f"unknown --key {args.key!r}")
-
-    if args.key == "right_option" and "other-dictation-app" in subprocess.run(
-        ["pgrep", "-fl", "other-dictation-app"], capture_output=True, text=True
-    ).stdout:
-        print("warning: a pre-existing dictation app is running and also grabs right Option — quit it or pick another --key")
 
     print(f"loading {args.model} ...", flush=True)
     model = load(args.model)

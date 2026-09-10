@@ -1,9 +1,8 @@
 # ptt-dictate
 
-Hold-to-talk dictation on the local VibeVoice-ASR-Streaming 1.5B (MLX) — the
-local replacement for a pre-existing dictation app's push-to-talk, with the same feel: hold the key,
-the model transcribes as you speak, release and the text lands in whatever app
-has focus.
+Hold-to-talk dictation on a local VibeVoice-ASR-Streaming model (MLX 8-bit) —
+hold the key, the model transcribes as you speak, release and the text lands in
+whatever app has focus.
 
 One warm daemon, no cloud round-trip, ~0.3s from key release to pasted text,
 plus a floating status pill while you speak.
@@ -31,21 +30,29 @@ vanishes, which is exactly what the default NSPanel behaviour does here.
 
 ## Requirements
 
-Everything is reused from the existing local audio setup — nothing to install
-except one pyobjc module:
+- **A Python env** with `mlx-audio[stt]`, `sounddevice` and `pyobjc-framework-Quartz`:
 
-- **venv**: `~/venv` (mlx + mlx-audio + sounddevice; shared
-  with `~/models/another-captions-script` and the `another-skill` skill)
-- **pyobjc**: `uv pip install --python ~/venv/bin/python pyobjc-framework-Quartz`
-- **model**: `~/models/vibevoice-asr-streaming-1.5b-mlx-8bit` (2.8GB) — the only
-  local checkpoint; `--model` can point elsewhere if one is ever added
-- **permissions**: Accessibility + Microphone for the interpreter (TCC prompts
-  on first use)
+  ```bash
+  uv venv ~/venv
+  uv pip install --python ~/venv/bin/python \
+      "mlx-audio[stt]" sounddevice pyobjc-framework-Quartz
+  ```
+
+  (Swap in any interpreter; point `PTT_PYTHON` at it for `install.sh`.)
+- **Model**: a VibeVoice ASR **streaming** checkpoint in MLX form (the local
+  8-bit conversion used here is 2.8GB). `--model` takes a path or any HF repo id
+  that mlx-audio can load as `vibevoice_asr`.
+- **Permissions**: Accessibility + Microphone for the interpreter (TCC prompts
+  on first use).
 
 ## Use
 
 ```bash
-~/venv/bin/python ~/ptt-dictate/ptt_dictate.py --key right_option
+./install.sh                    # login daemon, defaults to --key right_option
+./install.sh --key f13          # or a key nothing else wants
+
+# or run it in the foreground
+~/venv/bin/python ./ptt_dictate.py --key right_option
 ```
 
 Then hold the key, speak, release.
@@ -54,7 +61,7 @@ Then hold the key, speak, release.
 |------|---------|-------|
 | `--key` | `right_option` | `left_option`, `right_command`, `left_command`, `right_shift`, `left_shift`, `right_control`, `left_control`, `fn`, or `f13`–`f19` |
 | `--model` | 1.5B streaming | path to any streaming checkpoint |
-| `--context` | `""` | hotwords/names, e.g. `"Kubernetes, Postgres, Terraform"` |
+| `--context` | `""` | hotwords/names, e.g. `"Kubernetes, Postgres, Terraform"` — your own name, colleagues and customer names are the useful ones |
 | `--live-file` | `""` | append live partials to a file |
 | `--tail-ms` | `200` | extra mic time after release, to catch the last syllable |
 | `--device` | system default | input device index or name |
@@ -88,15 +95,18 @@ boundaries, light punctuation).
 
 ## Install as a login daemon
 
-`local.ptt-dictate.plist` runs this at login, keeps it alive, and logs
-to `~/Library/Logs/ptt-dictate/daemon.log`. The model stays resident (~3.1GB).
+`install.sh` generates `~/Library/LaunchAgents/local.ptt-dictate.plist` from
+this repo's own location and `$HOME`, runs it at login, keeps it alive, and
+logs to `~/Library/Logs/ptt-dictate/daemon.log`. The model stays resident
+(~3GB). Nothing machine-specific is committed — `launchctl bootstrap` cannot
+expand `~`, so the paths are written at install time.
 
 ```bash
-cp local.ptt-dictate.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.ptt-dictate.plist
+./install.sh --key right_option --context "Kubernetes, Postgres"
+./uninstall.sh                                                   # stop + remove
 
 launchctl print gui/$(id -u)/local.ptt-dictate | grep -E 'state|pid'   # status
-launchctl bootout gui/$(id -u)/local.ptt-dictate                        # stop
+launchctl bootout gui/$(id -u)/local.ptt-dictate                       # stop only
 ```
 
 Editing the script requires a bootout + bootstrap to take effect. Because
@@ -134,10 +144,11 @@ Editing the script requires a bootout + bootstrap to take effect. Because
   colon for one argument (`hideNow_` → `hideNow:`). `do_hide_pill_` becomes
   `do:hide:pill:` and fails with `BadPrototypeError` at class-creation time.
   Leading-underscore names (`_build`) are not registered as selectors at all.
-- **a pre-existing dictation app must not hold the same key** — it ships bound to right Option. Quit it
-  and disable its autostart, or it takes the key back at next login:
-  `launchctl bootout gui/$(id -u)/a pre-existing dictation app && launchctl disable gui/$(id -u)/a pre-existing dictation app`
-  (revert with `enable` + `bootstrap`; its plist is left in place).
+- **Something else on the same key**: only one app can own a hotkey. If a
+dictation or input tool already holds it, quit it and disable its autostart, or
+it takes the key back at next login — check `~/Library/LaunchAgents/` and any
+input-method settings. On macOS the right-Option key is a popular choice, so a
+pre-existing dictation tool is the usual culprit.
 - **Modifier keys and the flag mask**: down/up is read from the event's modifier
   flags, so holding *both* option keys and releasing only the bound one will not
   register a release until both are up. Bind a non-modifier (`f13`) if that
@@ -155,5 +166,5 @@ Editing the script requires a bootout + bootstrap to take effect. Because
 
 ## Not implemented
 
-- A LaunchAgent would like `--context` filled in for you (proper nouns are where
-  the 1.5B slips); edit `ProgramArguments` to add it
+- On-screen editing of the transcript, per-app hotkeys, and a tray/menu item —
+the pill shows state only, and text goes straight to the clipboard.
