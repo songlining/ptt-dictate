@@ -77,6 +77,7 @@ before letting it paste into live apps.
 | model load | ~0.8s from disk (the daemon keeps it resident) |
 | first partial | after ~3.5s of speech |
 | mic RMS | silence ~0.001, speech p90 ~0.06 |
+| idle CPU | 0.0% (the pill costs ~5% while it is on screen) |
 
 Text handling: the model prefixes chunks with `Speaker 0:` and emits
 `[Silence]`/`[Noise]` markers — both are stripped, and nothing is pasted when
@@ -85,11 +86,39 @@ the result is empty.
 Streaming output is content-accurate but not verbatim (chunk-granular
 boundaries, light punctuation).
 
+## Install as a login daemon
+
+`local.ptt-dictate.plist` runs this at login, keeps it alive, and logs
+to `~/Library/Logs/ptt-dictate/daemon.log`. The model stays resident (~3.1GB).
+
+```bash
+cp local.ptt-dictate.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.ptt-dictate.plist
+
+launchctl print gui/$(id -u)/local.ptt-dictate | grep -E 'state|pid'   # status
+launchctl bootout gui/$(id -u)/local.ptt-dictate                        # stop
+```
+
+Editing the script requires a bootout + bootstrap to take effect. Because
+`KeepAlive` restarts it, `kill` is not how you stop it — use `bootout`.
+
 ## Gotchas
 
-- **a pre-existing dictation app must not hold the same key** — it ships bound to right Option, so quit
-  it (or disable `~/Library/LaunchAgents/a pre-existing dictation app.plist`) before using
-  `--key right_option`. The script warns when it detects a pre-existing dictation app running.
+- **Never name a method of an `NSObject` subclass `release`** (or `press`). It
+  shadows `-release`, and since `performSelectorOnMainThread:` retains/releases
+  its receiver, the override re-enters itself forever: a permanent ~100% CPU
+  spin from the instant the object exists — even with the window never created
+  or shown. This cost a long debugging session; the pill methods are `show_pill`
+  / `hide_pill` for that reason.
+- **pyobjc turns EVERY underscore into a colon** when deriving a selector:
+  a method called via `performSelectorOnMainThread_` must map to exactly one
+  colon for one argument (`hideNow_` → `hideNow:`). `do_hide_pill_` becomes
+  `do:hide:pill:` and fails with `BadPrototypeError` at class-creation time.
+  Leading-underscore names (`_build`) are not registered as selectors at all.
+- **a pre-existing dictation app must not hold the same key** — it ships bound to right Option. Quit it
+  and disable its autostart, or it takes the key back at next login:
+  `launchctl bootout gui/$(id -u)/a pre-existing dictation app && launchctl disable gui/$(id -u)/a pre-existing dictation app`
+  (revert with `enable` + `bootstrap`; its plist is left in place).
 - **Modifier keys and the flag mask**: down/up is read from the event's modifier
   flags, so holding *both* option keys and releasing only the bound one will not
   register a release until both are up. Bind a non-modifier (`f13`) if that
@@ -107,4 +136,5 @@ boundaries, light punctuation).
 
 ## Not implemented
 
-- Autostart at login (a LaunchAgent + a 2.8GB resident model)
+- A LaunchAgent would like `--context` filled in for you (proper nouns are where
+  the 1.5B slips); edit `ProgramArguments` to add it

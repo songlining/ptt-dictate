@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.ptt-dictate</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>~/venv/bin/python</string>
+    <string>~/ptt-dictate/ptt_dictate.py</string>
+    <string>--key</string>
+    <string>right_option</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- latency-sensitive: keep it out of App Nap / background QoS throttling -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>StandardOutPath</key>
+  <string>~/Library/Logs/ptt-dictate/daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>~/Library/Logs/ptt-dictate/daemon.log</string>
+</dict>
+</plist>

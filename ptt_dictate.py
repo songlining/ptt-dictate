@@ -14,12 +14,14 @@ this (TCC prompts on first use). a pre-existing dictation app must not hold the 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import queue
 import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -175,7 +177,7 @@ class Overlay(AppKit.NSObject):
         content.addSubview_(meter)
         self.panel, self.label, self.meter = panel, label, meter
 
-    def press(self) -> None:
+    def show_pill(self) -> None:
         self.label.setStringValue_(self.prompt)
         self.meter.setBars_([0.0] * METER_BARS)
         self.panel.orderFrontRegardless()
@@ -185,12 +187,22 @@ class Overlay(AppKit.NSObject):
             0.06, self, "tick:", None, True
         )
 
-    def release(self) -> None:
-        """Called from the recorder thread — hop to the main thread for AppKit."""
-        self.performSelectorOnMainThread_withObject_waitUntilDone_("doRelease:", None, False)
+    def hide_pill(self) -> None:
+        """Called from the recorder thread — hop to the main thread for AppKit.
 
-    def doRelease_(self, _):
-        # A queued release can land after a newer press — never hide a live one.
+        NOT named `release`: that shadows NSObject's -release, and because
+        performSelectorOnMainThread: retains/releases its receiver, the override
+        re-enters itself forever — a permanent ~100% CPU spin from the moment
+        the object exists. Same trap for `press`. Keep these names selector-free.
+
+        Also note pyobjc turns EVERY underscore into a colon when deriving a
+        selector, so a name called through performSelectorOnMainThread_ must map
+        to exactly one colon for one argument (`hideNow_` -> `hideNow:`).
+        """
+        self.performSelectorOnMainThread_withObject_waitUntilDone_("hideNow:", None, False)
+
+    def hideNow_(self, _):
+        # A queued hide can land after a newer press — never hide a live one.
         if self.recorder is not None and getattr(self.recorder, "active", False):
             return
         if self.timer is not None:
@@ -316,7 +328,7 @@ class Recorder:
         )
         self.stream.start()
         if self.overlay is not None:
-            self.overlay.press()
+            self.overlay.show_pill()
         print("● listening", flush=True)
 
     def release(self, tail_ms: int = 200) -> None:
@@ -342,7 +354,7 @@ class Recorder:
             print(f"release failed: {exc!r}", flush=True)
         finally:
             if self.overlay is not None:
-                self.overlay.release()
+                self.overlay.hide_pill()
             with self.lock:
                 self.busy = False
 
@@ -436,6 +448,14 @@ def main() -> None:
     if args.self_test:
         self_test()
         return
+
+    # Two daemons on the same key both paste — and the LaunchAgent keeps one
+    # running. flock is released by the kernel on exit, so no stale pidfile.
+    lock = open(os.path.join(tempfile.gettempdir(), "ptt-dictate.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("another ptt_dictate is already running (launchctl bootout local.ptt-dictate)")
 
     if args.device and args.device.isdigit():
         args.device = int(args.device)
