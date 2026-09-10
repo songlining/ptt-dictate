@@ -206,7 +206,7 @@ class Overlay(AppKit.NSObject):
         self.label.setStringValue_(ellipsize(text or self.prompt))
 
 
-def paste(text: str) -> None:
+def paste(text: str, restore_delay: float = 0.6) -> None:
     """Put `text` on the clipboard, hit Cmd-V, then restore the old clipboard."""
     pb = AppKit.NSPasteboard.generalPasteboard()
     previous = pb.stringForType_(AppKit.NSPasteboardTypeString)
@@ -217,7 +217,10 @@ def paste(text: str) -> None:
         event = Quartz.CGEventCreateKeyboardEvent(src, 9, down)  # 9 = 'v'
         Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-    time.sleep(0.25)  # let the target app consume the paste
+    # ponytail: fixed delay — the target app reads the pasteboard asynchronously,
+    # so a slow app would paste the restored *old* contents. Raise --paste-delay
+    # if that ever shows up; there is no "did you read it?" hook to poll.
+    time.sleep(restore_delay)
     if previous is not None:
         pb.clearContents()
         pb.setString_forType_(previous, AppKit.NSPasteboardTypeString)
@@ -226,13 +229,14 @@ def paste(text: str) -> None:
 class Recorder:
     """One press-to-release dictation cycle against a loaded streaming model."""
 
-    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None):
+    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6):
         self.model = model
         self.context = context
         self.live_file = live_file
         self.dry_run = dry_run
         self.device = device
         self.overlay = overlay
+        self.paste_delay = paste_delay
         if overlay is not None:
             overlay.recorder = self
         self.SR = model.sample_rate
@@ -331,7 +335,7 @@ class Recorder:
             if text:
                 print(f"→ {text}", flush=True)
                 if not self.dry_run:
-                    paste(text)
+                    paste(text, self.paste_delay)
             else:
                 print("→ (nothing)", flush=True)
         except Exception as exc:  # keep the daemon alive through a bad cycle
@@ -423,6 +427,7 @@ def main() -> None:
     ap.add_argument("--tail-ms", type=int, default=200, help="extra mic time after key release")
     ap.add_argument("--device", default=None, help="input device index/name (default: system default)")
     ap.add_argument("--dry-run", action="store_true", help="print instead of pasting")
+    ap.add_argument("--paste-delay", type=float, default=0.6, help="seconds before the old clipboard is restored")
     ap.add_argument("--no-overlay", action="store_true", help="skip the floating status pill")
     ap.add_argument("--overlay-text", default="直接说", help="pill text while waiting for speech")
     ap.add_argument("--self-test", action="store_true")
@@ -460,7 +465,7 @@ def main() -> None:
         0.5, KeepAlive.alloc().init(), "noop:", None, True
     )
     overlay = None if args.no_overlay else Overlay.alloc().initWithPrompt_(args.overlay_text)
-    recorder = Recorder(model, args.context, args.live_file, args.dry_run, args.device, overlay)
+    recorder = Recorder(model, args.context, args.live_file, args.dry_run, args.device, overlay, args.paste_delay)
     print(
         f"ready: {args.key} (keycode {keycode}) | {model.sample_rate}Hz "
         f"window {model.streaming_window_samples / model.sample_rate:.2f}s "

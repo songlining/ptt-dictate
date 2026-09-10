@@ -59,6 +59,7 @@ Then hold the key, speak, release.
 | `--tail-ms` | `200` | extra mic time after release, to catch the last syllable |
 | `--device` | system default | input device index or name |
 | `--dry-run` | off | print the text instead of pasting it |
+| `--paste-delay` | `0.6` | seconds the transcript stays on the clipboard before the old one is restored |
 | `--no-overlay` | off | no status pill (headless / scripted use) |
 | `--overlay-text` | `直接说` | pill text while waiting for speech |
 | `--self-test` | — | window bookkeeping, text cleaning, meter curve — no model load |
