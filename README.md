@@ -37,8 +37,8 @@ except one pyobjc module:
 - **venv**: `~/venv` (mlx + mlx-audio + sounddevice; shared
   with `~/models/another-captions-script` and the `another-skill` skill)
 - **pyobjc**: `uv pip install --python ~/venv/bin/python pyobjc-framework-Quartz`
-- **model**: `~/models/vibevoice-asr-streaming-1.5b-mlx-8bit` (2.8GB), or the 7B
-  via `--model ~/models/VibeVoice-ASR-Streaming-7B-mlx-8bit`
+- **model**: `~/models/vibevoice-asr-streaming-1.5b-mlx-8bit` (2.8GB) — the only
+  local checkpoint; `--model` can point elsewhere if one is ever added
 - **permissions**: Accessibility + Microphone for the interpreter (TCC prompts
   on first use)
 
