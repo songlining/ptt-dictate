@@ -13,7 +13,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LABEL=local.ptt-dictate
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/ptt-dictate/daemon.log"
-PYTHON="${PTT_PYTHON:-$HOME/venv/bin/python}"
+PYTHON="${PTT_PYTHON:-$HOME/models/venv-mlx-audio/bin/python}"
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "interpreter not found: $PYTHON" >&2

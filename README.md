@@ -33,8 +33,8 @@ vanishes, which is exactly what the default NSPanel behaviour does here.
 - **A Python env** with `mlx-audio[stt]`, `sounddevice` and `pyobjc-framework-Quartz`:
 
   ```bash
-  uv venv ~/venv
-  uv pip install --python ~/venv/bin/python \
+  uv venv ~/models/venv-mlx-audio
+  uv pip install --python ~/models/venv-mlx-audio/bin/python \
       "mlx-audio[stt]" sounddevice pyobjc-framework-Quartz
   ```
 
@@ -52,7 +52,7 @@ vanishes, which is exactly what the default NSPanel behaviour does here.
 ./install.sh --key f13          # or a key nothing else wants
 
 # or run it in the foreground
-~/venv/bin/python ./ptt_dictate.py --key right_option
+~/models/venv-mlx-audio/bin/python ./ptt_dictate.py --key right_option
 ```
 
 Then hold the key, speak, release.
