@@ -104,16 +104,16 @@ Editing the script requires a bootout + bootstrap to take effect. Because
 
 ## Gotchas
 
-- **A disconnecting Bluetooth headset silently breaks the mic.** PortAudio
-  snapshots its device list at init and never re-reads it, so when the default
-  device vanishes (headset off / out of range) every press fails with
-  `-10851 Invalid Property Value` and captures silence — which surfaced in the
-  log as a run of `→ (nothing)` with no explanation. Presses now re-open the
-  stream and refresh the device list on failure, abort with
-  `! mic unavailable — press skipped` rather than pretending to work, and a 30s
-  idle refresh re-reads the list so a *reconnected* headset becomes the default
-  input again. The startup line `mic: <name> (native <rate>Hz)` records which
-  device is actually in use.
+- **A Bluetooth headset coming or going changes the default input.** PortAudio
+  caches the device list at init and never re-reads it, so a vanished default
+  device made every press fail with `-10851 Invalid Property Value` and capture
+  silence — which surfaced as a run of `→ (nothing)` with no explanation. The
+  other half of the trap: once the headset returned we would have stayed on the
+  built-in mic forever. A full device re-scan costs ~3ms, so every press now
+  re-scans and opens whatever is *currently* the default input, with one retry
+  after a second re-scan if the open fails. A press that still cannot get a mic
+  aborts with `! mic unavailable — press skipped` instead of pretending, and the
+  log prints `mic: <name>` whenever the device in use changes.
 - **macOS can disable the event tap behind your back** — on callback timeout or
   during secure input it stops delivering events *silently*: the process looks
   healthy, idles at 0% CPU, and hears nothing until restarted. Symptom is

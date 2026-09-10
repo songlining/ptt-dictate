@@ -259,6 +259,7 @@ class Recorder:
         self.device = device
         self.overlay = overlay
         self.paste_delay = paste_delay
+        self.last_device = None
         if overlay is not None:
             overlay.recorder = self
         self.SR = model.sample_rate
@@ -316,16 +317,26 @@ class Recorder:
         self.q.put(bytes(data))
 
     def _open_stream(self) -> None:
-        """Open the mic, refreshing PortAudio's device list if it looks stale.
+        """Open whatever is *currently* the default input device.
 
-        PortAudio snapshots the device list at Pa_Initialize and never re-reads
-        it, so when a Bluetooth headset disappears the default device index can
-        point at a device that no longer exists (-10851 Invalid Property Value)
-        on every attempt until the process restarts. Terminate/initialize
-        re-reads the list.
+        PortAudio caches the device list at Pa_Initialize and never re-reads it,
+        so a Bluetooth headset coming or going leaves us pointing at a device
+        that may no longer exist (-10851 Invalid Property Value) — or silently
+        stuck on the built-in mic after the headset is back. A full re-scan
+        costs ~3ms, so we do it every press: always the live default.
         """
+        sd._terminate()
+        sd._initialize()
         for attempt in (1, 2):
             try:
+                if self.device is None:
+                    dev = sd.query_devices(sd.default.device[0])
+                    if dev["name"] != self.last_device:
+                        print(
+                            f"mic: {dev['name']} (native {dev['default_samplerate']:.0f}Hz)",
+                            flush=True,
+                        )
+                        self.last_device = dev["name"]
                 self.stream = sd.InputStream(
                     device=self.device,
                     samplerate=self.SR,
@@ -338,7 +349,7 @@ class Recorder:
             except Exception as exc:
                 if attempt == 2:
                     raise
-                print(f"! cannot open mic ({exc}) — refreshing audio devices", flush=True)
+                print(f"! mic open failed ({exc}) — re-scanning audio devices", flush=True)
                 sd._terminate()
                 sd._initialize()
 
@@ -590,20 +601,14 @@ def main() -> None:
     Quartz.CGEventTapEnable(tap, True)
 
     def heartbeat() -> None:
-        """Re-arm the tap if the system disabled it, and keep PortAudio's device
-        list fresh so a reconnected Bluetooth headset becomes the default input
-        again (only while idle — never mid-record)."""
+        """Re-arm the tap if the system disabled it behind our back."""
         nonlocal held
-        if not Quartz.CGEventTapIsEnabled(tap):
-            Quartz.CGEventTapEnable(tap, True)
-            held = False
-            print("! tap found disabled — re-armed", flush=True)
-        ticks["n"] += 1
-        if ticks["n"] % 60 == 0 and not (recorder.active or recorder.busy):
-            sd._terminate()
-            sd._initialize()
+        if Quartz.CGEventTapIsEnabled(tap):
+            return
+        Quartz.CGEventTapEnable(tap, True)
+        held = False
+        print("! tap found disabled — re-armed", flush=True)
 
-    ticks = {"n": 0}
     AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.5, KeepAlive.alloc().initWithCheck_(heartbeat), "noop:", None, True
     )
