@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""Hold-to-talk dictation on the local VibeVoice-ASR-Streaming 1.5B (MLX).
+
+Hold the hotkey: the mic streams into a warm model, live partials print as they
+land. Release: one final flush step (~0.3s), then the text is pasted into
+whatever app has focus (clipboard + Cmd-V, so Chinese works).
+
+    ~/venv/bin/python ~/ptt-dictate/ptt_dictate.py --key right_option
+
+One-time setup: grant Accessibility + Microphone to the interpreter running
+this (TCC prompts on first use). a pre-existing dictation app must not hold the same key.
+"""
+
+from __future__ import annotations
+
+import argparse
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+
+import numpy as np
+import Quartz
+import AppKit
+import sounddevice as sd
+import mlx.core as mx
+from mlx_audio.stt import load
+
+DEFAULT_MODEL = "~/models/vibevoice-asr-streaming-1.5b-mlx-8bit"
+
+# keycode -> (modifier flag mask or None for a normal key)
+MODIFIERS = {
+    "right_option": (61, Quartz.kCGEventFlagMaskAlternate),
+    "left_option": (58, Quartz.kCGEventFlagMaskAlternate),
+    "right_command": (54, Quartz.kCGEventFlagMaskCommand),
+    "left_command": (55, Quartz.kCGEventFlagMaskCommand),
+    "right_shift": (60, Quartz.kCGEventFlagMaskShift),
+    "left_shift": (56, Quartz.kCGEventFlagMaskShift),
+    "right_control": (62, Quartz.kCGEventFlagMaskControl),
+    "left_control": (59, Quartz.kCGEventFlagMaskControl),
+    "fn": (63, Quartz.kCGEventFlagMaskSecondaryFn),
+}
+PLAIN_KEYS = {"f13": 105, "f14": 107, "f15": 113, "f16": 106, "f17": 64, "f18": 79, "f19": 80}
+
+NOISE = re.compile(r"\[(?:silence|noise|music|applause|laughter|inaudible)\]", re.I)
+SPEAKER = re.compile(r"\s*speaker\s*\d+\s*:\s*", re.I)
+
+
+def clean(text: str) -> str:
+    """Strip the model's `Speaker 0:` prefix and `[Silence]`-style markers."""
+    return re.sub(r"\s+", " ", NOISE.sub(" ", SPEAKER.sub(" ", text))).strip()
+
+
+def paste(text: str) -> None:
+    """Put `text` on the clipboard, hit Cmd-V, then restore the old clipboard."""
+    pb = AppKit.NSPasteboard.generalPasteboard()
+    previous = pb.stringForType_(AppKit.NSPasteboardTypeString)
+    pb.clearContents()
+    pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
+    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+    for down in (True, False):
+        event = Quartz.CGEventCreateKeyboardEvent(src, 9, down)  # 9 = 'v'
+        Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+    time.sleep(0.25)  # let the target app consume the paste
+    if previous is not None:
+        pb.clearContents()
+        pb.setString_forType_(previous, AppKit.NSPasteboardTypeString)
+
+
+class Recorder:
+    """One press-to-release dictation cycle against a loaded streaming model."""
+
+    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None):
+        self.model = model
+        self.context = context
+        self.live_file = live_file
+        self.dry_run = dry_run
+        self.device = device
+        self.SR = model.sample_rate
+        self.WIN = model.streaming_window_samples
+        self.ADV = model.streaming_chunk_samples
+        self.lock = threading.Lock()
+        self.active = False
+        self.busy = False
+        self.reset()
+
+    def reset(self) -> None:
+        self.buf = np.zeros(0, dtype=np.float32)
+        self.steps = 0
+        self.parts: list[str] = []
+        self.state = None
+        self.stop = threading.Event()
+
+    def feed(self, chunk: np.ndarray) -> None:
+        """Buffer new audio; step once per full window, sliding by the advance.
+
+        Mirrors the model's own chunk iterator: window k covers
+        [k*ADV, k*ADV+WIN), so the lookahead tail of one window is the head of
+        the next. Feeding a wider overlap makes the model re-transcribe it.
+        """
+        self.buf = np.concatenate([self.buf, chunk])
+        while self.buf.size >= self.WIN:
+            self._step()
+            self.buf = self.buf[self.ADV :]
+
+    def flush(self) -> None:
+        """Final step on the tail, right-padded — same as pad_last_chunk."""
+        if self.buf.size >= self.SR // 10:
+            self._step()
+
+    def _step(self) -> None:
+        window = self.buf[: self.WIN]
+        if window.size < self.WIN:
+            window = np.pad(window, (0, self.WIN - window.size))  # pad the tail, not the head
+        features = self.model.encode_speech(mx.array(window)[None, :])
+        text, self.state = self.model.streaming_generate_step(features, self.state)
+        self.steps += 1
+        piece = clean(text)
+        if piece:
+            self.parts.append(piece)
+            print(f"  {piece}", flush=True)
+            if self.live_file:
+                with open(self.live_file, "a") as fh:
+                    fh.write(piece + "\n")
+
+    def press(self) -> None:
+        with self.lock:
+            if self.active or self.busy:
+                return
+            self.active = True
+        self.reset()
+        self.state = (
+            self.model.init_streaming_state(context_info=self.context)
+            if self.context
+            else self.model.init_streaming_state()
+        )
+        self.q: queue.Queue = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        self.stream = sd.InputStream(
+            device=self.device,
+            samplerate=self.SR,
+            channels=1,
+            dtype="float32",
+            callback=lambda data, frames, t, status: self.q.put(bytes(data)),
+        )
+        self.stream.start()
+        print("● listening", flush=True)
+
+    def release(self, tail_ms: int = 200) -> None:
+        with self.lock:
+            if not self.active:
+                return
+            self.active = False
+            self.busy = True
+        try:
+            time.sleep(tail_ms / 1000)  # catch the last syllable before the mic closes
+            self.stream.stop()
+            self.stream.close()
+            self.stop.set()
+            self.thread.join()
+            text = clean(" ".join(self.parts))
+            if text:
+                print(f"→ {text}", flush=True)
+                if not self.dry_run:
+                    paste(text)
+            else:
+                print("→ (nothing)", flush=True)
+        except Exception as exc:  # keep the daemon alive through a bad cycle
+            print(f"release failed: {exc!r}", flush=True)
+        finally:
+            with self.lock:
+                self.busy = False
+
+    def _run(self) -> None:
+        while not self.stop.is_set():
+            try:
+                block = self.q.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            self.feed(np.frombuffer(block, dtype=np.float32))
+        while True:  # drain whatever arrived between the last read and the stop
+            try:
+                block = self.q.get_nowait()
+            except queue.Empty:
+                break
+            self.feed(np.frombuffer(block, dtype=np.float32))
+        if self.buf.size or self.steps == 0:
+            self.flush()
+
+
+class _FakeModel:
+    """Self-test stand-in: WIN=3 samples, ADV=2 samples."""
+
+    sample_rate = 10  # keeps the flush threshold at one sample
+    streaming_window_samples = 3
+    streaming_chunk_samples = 2
+
+    def __init__(self):
+        self.n = 0
+
+    def init_streaming_state(self, **kwargs):
+        return {}
+
+    def encode_speech(self, x):
+        return x
+
+    def streaming_generate_step(self, features, state):
+        self.n += 1
+        return f" \n Speaker 0:chunk{self.n} [Silence]", state
+
+
+def self_test() -> None:
+    assert clean(" \n Speaker 0:Hello there ") == "Hello there"
+    assert clean("Speaker 0:Hello Speaker 1:world") == "Hello world"
+    assert clean("[Silence]") == ""
+    assert clean("[Noise] [Silence]") == ""
+
+    rec = Recorder(_FakeModel(), dry_run=True)
+    rec.reset()
+    rec.state = rec.model.init_streaming_state()
+    rec.feed(np.ones(3, dtype=np.float32))  # first step: full window
+    assert rec.steps == 1, rec.steps
+    rec.feed(np.ones(1, dtype=np.float32))  # below ADV -> no step
+    assert rec.steps == 1, rec.steps
+    rec.feed(np.ones(1, dtype=np.float32))  # ADV reached -> step
+    assert rec.steps == 2, rec.steps
+    rec.feed(np.ones(1, dtype=np.float32))  # tail, flushed on release
+    assert rec.steps == 2, rec.steps
+    rec.flush()
+    assert rec.steps == 3, rec.steps
+    assert rec.parts == ["chunk1", "chunk2", "chunk3"], rec.parts
+    # window bookkeeping: window k = [k*ADV, k*ADV+WIN) — no wider overlap
+    rec.reset()
+    rec.state = rec.model.init_streaming_state()
+    rec.buf = np.arange(7, dtype=np.float32)
+    seen = []
+    rec._step = lambda: seen.append(rec.buf[: rec.WIN].copy())
+    rec.feed(np.zeros(0, dtype=np.float32))
+    assert [w.tolist() for w in seen] == [[0, 1, 2], [2, 3, 4], [4, 5, 6]], seen
+    print("self-test OK")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--key", default="right_option", help=f"{', '.join(MODIFIERS)} or f13..f19")
+    ap.add_argument("--context", default="", help="hotwords / names fed to the model")
+    ap.add_argument("--live-file", default="", help="append live partials to this file")
+    ap.add_argument("--tail-ms", type=int, default=200, help="extra mic time after key release")
+    ap.add_argument("--device", default=None, help="input device index/name (default: system default)")
+    ap.add_argument("--dry-run", action="store_true", help="print instead of pasting")
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args()
+
+    if args.self_test:
+        self_test()
+        return
+
+    if args.device and args.device.isdigit():
+        args.device = int(args.device)
+    if args.key in MODIFIERS:
+        keycode, flag = MODIFIERS[args.key]
+    elif args.key in PLAIN_KEYS:
+        keycode, flag = PLAIN_KEYS[args.key], None
+    else:
+        sys.exit(f"unknown --key {args.key!r}")
+
+    if args.key == "right_option" and "other-dictation-app" in subprocess.run(
+        ["pgrep", "-fl", "other-dictation-app"], capture_output=True, text=True
+    ).stdout:
+        print("warning: a pre-existing dictation app is running and also grabs right Option — quit it or pick another --key")
+
+    print(f"loading {args.model} ...", flush=True)
+    model = load(args.model)
+    if not model.is_streaming_model:
+        sys.exit("not a streaming checkpoint")
+    recorder = Recorder(model, args.context, args.live_file, args.dry_run, args.device)
+    print(
+        f"ready: {args.key} (keycode {keycode}) | {model.sample_rate}Hz "
+        f"window {model.streaming_window_samples / model.sample_rate:.2f}s "
+        f"advance {model.streaming_chunk_samples / model.sample_rate:.2f}s"
+    )
+    print(">>> HOLD the key to dictate, release to paste <<<", flush=True)
+
+    mask = (
+        Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
+        | Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
+        | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp)
+    )
+    held = False
+
+    def callback(proxy, type_, event, refcon):
+        nonlocal held
+        code = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+        if code != keycode:
+            return event
+        if flag is not None:
+            down = bool(Quartz.CGEventGetFlags(event) & flag)
+        else:
+            down = type_ == Quartz.kCGEventKeyDown
+        if down == held:
+            return event
+        held = down
+        if down:
+            recorder.press()
+        else:
+            threading.Thread(
+                target=recorder.release, args=(args.tail_ms,), daemon=True
+            ).start()
+        return event
+
+    tap = Quartz.CGEventTapCreate(
+        Quartz.kCGSessionEventTap,
+        Quartz.kCGHeadInsertEventTap,
+        Quartz.kCGEventTapOptionListenOnly,
+        mask,
+        callback,
+        None,
+    )
+    if tap is None:
+        sys.exit("cannot create event tap — grant Accessibility to this interpreter")
+
+    source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+    Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source, Quartz.kCFRunLoopCommonModes)
+    Quartz.CGEventTapEnable(tap, True)
+    try:
+        Quartz.CFRunLoopRun()
+    except KeyboardInterrupt:
+        print("\nbye")
+
+
+if __name__ == "__main__":
+    main()
