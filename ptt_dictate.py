@@ -315,6 +315,33 @@ class Recorder:
         self.level = float(np.sqrt(np.mean(np.square(data))))
         self.q.put(bytes(data))
 
+    def _open_stream(self) -> None:
+        """Open the mic, refreshing PortAudio's device list if it looks stale.
+
+        PortAudio snapshots the device list at Pa_Initialize and never re-reads
+        it, so when a Bluetooth headset disappears the default device index can
+        point at a device that no longer exists (-10851 Invalid Property Value)
+        on every attempt until the process restarts. Terminate/initialize
+        re-reads the list.
+        """
+        for attempt in (1, 2):
+            try:
+                self.stream = sd.InputStream(
+                    device=self.device,
+                    samplerate=self.SR,
+                    channels=1,
+                    dtype="float32",
+                    callback=self._on_audio,
+                )
+                self.stream.start()
+                return
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                print(f"! cannot open mic ({exc}) — refreshing audio devices", flush=True)
+                sd._terminate()
+                sd._initialize()
+
     def press(self) -> None:
         with self.lock:
             if self.active or self.busy:
@@ -329,14 +356,17 @@ class Recorder:
         self.q: queue.Queue = queue.Queue()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
-        self.stream = sd.InputStream(
-            device=self.device,
-            samplerate=self.SR,
-            channels=1,
-            dtype="float32",
-            callback=self._on_audio,
-        )
-        self.stream.start()
+        try:
+            self._open_stream()
+        except Exception as exc:
+            # Abort cleanly: never leave `active` set (which would swallow the
+            # release) and never report the silence as an empty transcription.
+            print(f"! mic unavailable — press skipped: {exc}", flush=True)
+            self.stop.set()
+            self.thread.join()
+            with self.lock:
+                self.active = False
+            return
         if self.overlay is not None:
             self.overlay.show_pill()
         print("● listening", flush=True)
@@ -485,6 +515,15 @@ def main() -> None:
     model = load(args.model)
     if not model.is_streaming_model:
         sys.exit("not a streaming checkpoint")
+    try:
+        dev = sd.query_devices(args.device if args.device is not None else sd.default.device[0])
+        print(
+            f"mic: {dev['name']} (native {dev['default_samplerate']:.0f}Hz)"
+            f" — PortAudio asked for {model.sample_rate}Hz",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"mic: unavailable ({exc})", flush=True)
 
     # Accessory app: needed for the panel, but no Dock icon and never activated.
     app = AppKit.NSApplication.sharedApplication()
@@ -550,17 +589,23 @@ def main() -> None:
     Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), source, Quartz.kCFRunLoopCommonModes)
     Quartz.CGEventTapEnable(tap, True)
 
-    def tap_healthy() -> None:
-        """Re-arm the tap if the system disabled it behind our back."""
+    def heartbeat() -> None:
+        """Re-arm the tap if the system disabled it, and keep PortAudio's device
+        list fresh so a reconnected Bluetooth headset becomes the default input
+        again (only while idle — never mid-record)."""
         nonlocal held
-        if Quartz.CGEventTapIsEnabled(tap):
-            return
-        Quartz.CGEventTapEnable(tap, True)
-        held = False
-        print("! tap found disabled — re-armed", flush=True)
+        if not Quartz.CGEventTapIsEnabled(tap):
+            Quartz.CGEventTapEnable(tap, True)
+            held = False
+            print("! tap found disabled — re-armed", flush=True)
+        ticks["n"] += 1
+        if ticks["n"] % 60 == 0 and not (recorder.active or recorder.busy):
+            sd._terminate()
+            sd._initialize()
 
+    ticks = {"n": 0}
     AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-        0.5, KeepAlive.alloc().initWithCheck_(tap_healthy), "noop:", None, True
+        0.5, KeepAlive.alloc().initWithCheck_(heartbeat), "noop:", None, True
     )
     app.run()
 
