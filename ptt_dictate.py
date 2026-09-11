@@ -125,24 +125,17 @@ def peak_level(buf: np.ndarray, sr: int, block: float = 0.1) -> float:
     return float(np.sqrt(np.mean(np.square(usable), axis=1)).max())
 
 
-def silence_reason(buf: np.ndarray, sr: int, min_rms: float) -> str | None:
-    """Why this capture should not be transcribed, or None if it should be.
+def too_short(buf: np.ndarray, sr: int, min_seconds: float = 0.3) -> bool:
+    """A mis-tap, not worth a model run.
 
-    Not a hallucination guard: measured, Qwen3-ASR returns '' for digital
-    silence *and* for room tone, so it invents nothing on a stray tap. This is
-    a cheap guard that skips the model run on a mis-tap and — more usefully —
-    distinguishes a muted or disconnected mic from "the model heard nothing",
-    which is otherwise indistinguishable in the log. The threshold is therefore
-    deliberately low: room tone on a quiet headset peaks around 0.0006-0.006,
-    so anything higher risks silently dropping a quietly-spoken word.
-    (Whisper-class models *do* hallucinate on silence, hence keeping any gate.)
+    This is the *only* capture that gets skipped. There deliberately is no
+    loudness gate: measured, Qwen3-ASR returns '' for digital silence and for
+    room tone, so the model is its own authority on whether there was speech —
+    and a level threshold cannot separate "mic muted" from "spoken quietly",
+    which meant it silently ate real dictation once the input gain dropped.
+    Loudness is logged instead of enforced.
     """
-    if buf.size < sr * 0.3:
-        return f"only {buf.size / sr:.2f}s of audio"
-    peak = peak_level(buf, sr)
-    if peak < min_rms:
-        return f"too quiet (peak {peak:.4f} < {min_rms}) — mic muted?"
-    return None
+    return buf.size < sr * min_seconds
 
 
 class MeterView(AppKit.NSView):
@@ -402,10 +395,14 @@ class Recorder:
         return {}
 
     def _transcribe(self) -> None:
-        reason = silence_reason(self.buf, self.SR, self.min_rms)
-        if reason is not None:
-            print(f"  (skipped: {reason})", flush=True)
+        if too_short(self.buf, self.SR):
+            print(f"  (skipped: only {self.buf.size / self.SR:.2f}s of audio)", flush=True)
             return
+        peak = peak_level(self.buf, self.SR)
+        if peak < self.min_rms:
+            # Informational only — we still transcribe. Blocking here is how a
+            # quiet speaker ends up with "stopped working".
+            print(f"  (very quiet: peak {peak:.4f} — mic muted?)", flush=True)
         out = self.model.generate(self.buf, **self._bias_kwargs())
         piece = clean(result_text(out))
         if piece:
@@ -581,13 +578,12 @@ def self_test() -> None:
     assert parse_hotwords("  \n\n") == []
     # a phrase must survive as one term, not be split into independent words
     assert parse_hotwords("Alex Chen\nVault Radar") == ["Alex Chen", "Vault Radar"]
-    # the gate that stops a stray tap pasting invented words
-    assert silence_reason(np.zeros(16000, dtype=np.float32), 16000, 0.002) is not None  # silence
-    assert silence_reason(np.zeros(4000, dtype=np.float32), 16000, 0.002) is not None   # too short
-    assert silence_reason(np.full(16000, 0.05, dtype=np.float32), 16000, 0.002) is None  # speech
-    # room tone with one brief word in it must pass (peak, not average)
-    quiet = np.full(16000, 0.0009, dtype=np.float32); quiet[8000:8800] = 0.02
-    assert silence_reason(quiet, 16000, 0.002) is None, "a quiet short word was dropped"
+    # a mis-tap is skipped; loudness never blocks a transcription
+    assert too_short(np.zeros(4000, dtype=np.float32), 16000) is True    # 0.25s
+    assert too_short(np.zeros(16000, dtype=np.float32), 16000) is False  # 1s
+    assert peak_level(np.zeros(16000, dtype=np.float32), 16000) == 0.0
+    quiet = np.full(16000, 0.0003, dtype=np.float32); quiet[8000:8800] = 0.02
+    assert peak_level(quiet, 16000) > 0.01, "peak must find the loud part"
     assert meter_level(0.0) == 0.0
     assert 0.3 < meter_level(0.02) < 0.7, meter_level(0.02)  # quiet speech still moves
     assert meter_level(0.5) == 1.0  # clamped, never overflows the bar
@@ -628,8 +624,7 @@ def main() -> None:
     ap.add_argument("--mode", choices=("auto", "stream", "batch"), default="auto",
                     help="auto: streaming checkpoints stream, everything else batches")
     ap.add_argument("--min-rms", type=float, default=0.002,
-                    help="batch: skip captures whose loudest 100ms is below this"
-                         " (catches a muted mic; deliberately low)")
+                    help="batch: log a 'mic muted?' note below this level; still transcribes")
     ap.add_argument("--transcribe-file", default="", help="transcribe a file and exit (smoke test)")
     ap.add_argument("--live-file", default="", help="append live partials to this file")
     ap.add_argument("--tail-ms", type=int, default=200, help="extra mic time after key release")
