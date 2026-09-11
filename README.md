@@ -77,7 +77,8 @@ Then hold the key, speak, release.
 | `--key` | `right_option` | `left_option`, `right_command`, `left_command`, `right_shift`, `left_shift`, `right_control`, `left_control`, `fn`, or `f13`–`f19` |
 | `--model` | `mlx-community/Qwen3-ASR-1.7B-8bit` | path or HF repo id; streaming checkpoints auto-switch to `--mode stream` |
 | `--mode` | `auto` | `auto` \| `stream` \| `batch`. `auto` streams only for checkpoints with window/chunk metadata |
-| `--context` | `""` | names/jargon. In batch mode these become **real hotwords** (`hotwords=[...]`) when the model supports it — your own name, colleagues and customer names are the useful ones |
+| `--context` | `""` | names/jargon. In batch mode these become **real hotwords** (`hotwords=[...]`) when the model supports it. Merges with `--context-file` |
+| `--context-file` | `""` | file of hotwords, **re-read on every press** so edits apply without a restart |
 | `--min-rms` | `0.002` | batch: skip a capture whose loudest 100ms is below this. Catches a muted mic; deliberately low so a quietly-spoken word is never dropped |
 | `--transcribe-file` | `""` | transcribe a file and exit — smoke test, needs no hotkey and may run alongside the daemon |
 | `--live-file` | `""` | append live partials to a file |
@@ -91,6 +92,39 @@ Then hold the key, speak, release.
 
 Run it attended first (`--dry-run`) to confirm the hotkey and the transcript
 before letting it paste into live apps.
+
+## Hotwords
+
+ASR mis-hears two things above all: names, and English terms spoken inside a
+Chinese sentence (measured: `README` came out as *rhythm*, `parameter` as
+*Perimeter*, `Kubernetes` as *UberNitz*). Hotwords bias the decoder toward the
+right spelling, and Qwen3-ASR takes them as a first-class argument rather than
+as instructions embedded in a prompt.
+
+They live in a plain file:
+
+```
+~/.config/ptt-dictate/hotwords.txt
+```
+
+```
+# one term per line; # starts a comment
+Alex Chen
+Acme Corp
+Terraform
+Vault
+```
+
+The file is **re-read on every press**, so editing it applies to your very next
+dictation — no reinstall, no daemon restart. Phrases work (`Vault Radar`);
+splitting is on commas and newlines, not spaces, so a two-word term stays one
+term. `--context "a, b"` merges with the file, `--context-file PATH` relocates
+it, and `install.sh` seeds it from `--context` on first run (override the path
+with `PTT_HOTWORDS`).
+
+Keep the list to terms you actually dictate. A short, specific list is the point;
+nobody has measured what a long one does, and a list of everything you might ever
+say is unlikely to help.
 
 ## Runtime facts (measured on an M4 Pro, 8-bit MLX, 20s/10s clips)
 

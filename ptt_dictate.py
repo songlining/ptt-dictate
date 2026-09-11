@@ -73,6 +73,31 @@ def meter_level(rms: float) -> float:
     return min(1.0, max(0.0, rms) ** 0.5 * 3.2)
 
 
+def _dedupe(words: list[str]) -> list[str]:
+    """Case-insensitive dedupe, order preserved."""
+    seen, out = set(), []
+    for word in words:
+        key = word.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(word)
+    return out
+
+
+def parse_hotwords(text: str) -> list[str]:
+    """Hotwords from newline- or comma-separated text; `#` comments out the
+    rest of a line.
+
+    Splitting stops at commas and newlines — *not* whitespace — so a term may be
+    a phrase ("Vault Radar", "Alex Chen") rather than being torn into two
+    independent words.
+    """
+    words = []
+    for line in text.splitlines():
+        words += [w.strip() for w in line.split("#", 1)[0].split(",")]
+    return _dedupe([w for w in words if w])
+
+
 def result_text(out) -> str:
     """Text out of an mlx_audio STTOutput.
 
@@ -300,9 +325,10 @@ def paste(text: str, restore_delay: float = 0.6) -> None:
 class Recorder:
     """One press-to-release dictation cycle against a loaded ASR model."""
 
-    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6, batch: bool = False, min_rms: float = 0.005):
+    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6, batch: bool = False, min_rms: float = 0.005, context_file: str = ""):
         self.model = model
         self.context = context
+        self.context_file = context_file
         self.live_file = live_file
         self.dry_run = dry_run
         self.device = device
@@ -352,9 +378,25 @@ class Recorder:
         elif self.buf.size >= self.SR // 10:
             self._step()
 
+    def _hotwords(self) -> list[str]:
+        """--context plus the standing list in --context-file.
+
+        The file is re-read on every press, so adding a word takes effect on the
+        next dictation — no daemon restart, which matters because the useful
+        list only emerges from watching what the model actually mis-hears.
+        """
+        words = parse_hotwords(self.context)
+        if self.context_file:
+            try:
+                with open(self.context_file) as fh:
+                    words += parse_hotwords(fh.read())
+            except OSError:
+                pass
+        return _dedupe(words)
+
     def _bias_kwargs(self) -> dict:
-        """--context as real hotwords, when the model takes them (Qwen3-ASR does)."""
-        words = [w.strip() for w in self.context.split(",") if w.strip()]
+        """Hotwords, when the model takes them (Qwen3-ASR does)."""
+        words = self._hotwords()
         if words and "hotwords" in inspect.signature(self.model.generate).parameters:
             return {"hotwords": words}
         return {}
@@ -534,6 +576,11 @@ def self_test() -> None:
     assert clean("Speaker 0:Hello Speaker 1:world") == "Hello world"
     assert clean("[Silence]") == ""
     assert clean("[Noise] [Silence]") == ""
+    assert parse_hotwords("Terraform, Vault\n# a comment\nKubernetes") == ["Terraform", "Vault", "Kubernetes"]
+    assert parse_hotwords("Vault, vault, VAULT") == ["Vault"]  # case-insensitive dedupe
+    assert parse_hotwords("  \n\n") == []
+    # a phrase must survive as one term, not be split into independent words
+    assert parse_hotwords("Alex Chen\nVault Radar") == ["Alex Chen", "Vault Radar"]
     # the gate that stops a stray tap pasting invented words
     assert silence_reason(np.zeros(16000, dtype=np.float32), 16000, 0.002) is not None  # silence
     assert silence_reason(np.zeros(4000, dtype=np.float32), 16000, 0.002) is not None   # too short
@@ -575,6 +622,9 @@ def main() -> None:
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--key", default="right_option", help=f"{', '.join(MODIFIERS)} or f13..f19")
     ap.add_argument("--context", default="", help="names/jargon; real hotwords in batch mode")
+    ap.add_argument("--context-file", default="",
+                    help="file of hotwords (one per line, # comments); re-read every press"
+                         " so edits apply without a restart")
     ap.add_argument("--mode", choices=("auto", "stream", "batch"), default="auto",
                     help="auto: streaming checkpoints stream, everything else batches")
     ap.add_argument("--min-rms", type=float, default=0.002,
@@ -642,7 +692,7 @@ def main() -> None:
         signal.signal(sig, lambda *_: os._exit(0))
     overlay = None if args.no_overlay else Overlay.alloc().initWithPrompt_(args.overlay_text)
     recorder = Recorder(model, args.context, args.live_file, args.dry_run, args.device, overlay,
-                        args.paste_delay, batch, args.min_rms)
+                        args.paste_delay, batch, args.min_rms, args.context_file)
     if batch:
         print(
             f"ready: {args.key} (keycode {keycode}) | BATCH | {recorder.SR}Hz input"

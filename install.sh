@@ -27,6 +27,27 @@ if [[ $# -eq 0 ]]; then
   set -- --key right_option
 fi
 
+# Hotwords live in a file the script re-reads on every press, so adding a term
+# takes effect on the next dictation instead of needing a reinstall.
+HOTWORDS="${PTT_HOTWORDS:-$HOME/.config/ptt-dictate/hotwords.txt}"
+mkdir -p "$(dirname "$HOTWORDS")"
+if [[ ! -f "$HOTWORDS" ]]; then
+  {
+    echo '# ptt-dictate hotwords — names and jargon the model tends to mis-hear.'
+    echo '# One per line (or a comma-separated list); # starts a comment.'
+    echo '# Re-read on every press: edits apply to your next dictation, no restart.'
+    ctx=; prev=
+    for a in "$@"; do
+      [[ "$prev" == "--context" ]] && ctx="$a"
+      prev="$a"
+    done
+    if [[ -n "$ctx" ]]; then
+      printf '%s\n' "$ctx" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' || true
+    fi
+  } > "$HOTWORDS"
+  echo "seeded $HOTWORDS"
+fi
+
 mkdir -p "$(dirname "$LOG")"
 {
   echo '<?xml version="1.0" encoding="UTF-8"?>'
@@ -36,7 +57,7 @@ mkdir -p "$(dirname "$LOG")"
   echo '  <key>ProgramArguments</key><array>'
   echo "    <string>$PYTHON</string>"
   echo "    <string>$REPO/ptt_dictate.py</string>"
-  for arg in "$@"; do
+  for arg in "$@" --context-file "$HOTWORDS"; do
     echo "    <string>$arg</string>"
   done
   echo '  </array>'
@@ -73,4 +94,5 @@ fi
 echo "installed $LABEL"
 echo "  plist: $PLIST"
 echo "  log:   $LOG"
-echo "  first load takes ~15s (2.8GB model); then hold your hotkey and speak"
+echo "  hotwords: $HOTWORDS  (edit any time; applies to the next dictation)"
+echo "  first load takes ~15s; then hold your hotkey and speak"
