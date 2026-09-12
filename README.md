@@ -16,9 +16,10 @@ in the pill, at the cost of a hard 3.5s floor before any text can appear.
 ## How it works
 
 - A Quartz event tap watches one hotkey and **swallows** it, so an app that
-  binds the same key for its own hold-to-talk does not also fire. (some chat apps binds
-  right Option: without swallowing, one key press gives you a voice message *and*
-  the pasted text. a similar tool shipped the same behaviour as `block_keys: True`.)
+  binds the same key for its own hold-to-talk does not also fire. (Some chat
+  clients bind right Option for hold-to-talk: without swallowing, one key press
+  gives you a voice message *and* the pasted text. Mature dictation tools ship
+  the same behaviour, as a `block_keys`-style setting.)
   `--key-passthrough` opts out.
 - On press: the mic stream opens on the *current* default input device and audio
   is buffered; the pill appears with a live mic meter.
@@ -189,7 +190,7 @@ Editing the script requires a bootout + bootstrap to take effect. Because
 - **The hotkey is swallowed, so it is no longer usable as a modifier.** With
   right Option consumed by the daemon, Option+key on the *right* key no longer
   types special characters. That is the price of not double-firing in apps with
-  their own hold-to-talk, and it is what a similar tool did too. If you need the modifier
+  their own hold-to-talk, and it is what other dictation tools do too. If you need the modifier
   back, use `--key-passthrough` and accept the collision — or bind a key nothing
   else wants (`--key f13`).
 

@@ -649,8 +649,8 @@ def main() -> None:
     ap.add_argument("--transcribe-file", default="", help="transcribe a file and exit (smoke test)")
     ap.add_argument("--key-passthrough", action="store_true",
                     help="let other apps see the hotkey too (default: we swallow it,"
-                         " so an app with its own hold-to-talk on the same key e.g. some chat apps"
-                         " does not also fire). Costs you the key as a modifier.")
+                         " so an app with its own hold-to-talk on the same key, e.g. a chat"
+                         " client, does not also fire). Costs you the key as a modifier.")
     ap.add_argument("--live-file", default="", help="append live partials to this file")
     ap.add_argument("--tail-ms", type=int, default=200, help="extra mic time after key release")
     ap.add_argument("--device", default=None, help="input device index/name (default: system default)")
@@ -771,9 +771,9 @@ def main() -> None:
                 target=recorder.release, args=(args.tail_ms,), daemon=True
             ).start()
         # Swallow our own hotkey: returning None deletes the event, so apps that
-        # also bind this key never see the press. a similar tool did the same
-        # (`block_keys: True`) — without it some chat apps records a voice message from
-        # the same hold that starts dictation, giving two inputs per utterance.
+        # also bind this key never see the press. Without it, an app with its own
+        # hold-to-talk records a voice message from the same hold that starts
+        # dictation — two inputs per utterance.
         return event if passthrough else None
 
     tap = Quartz.CGEventTapCreate(
