@@ -166,6 +166,24 @@ class MeterView(AppKit.NSView):
             ).fill()
 
 
+class RepeatLimiter:
+    """Rate-limit a repeated identical log line.
+
+    A persistently disabled event tap (which is what an untrusted process looks
+    like) is re-armed every 0.5s, so logging each attempt would write ~15MB/day
+    of the same sentence. First occurrence always prints; after that, one in
+    every `every` ticks, so the state stays visible without flooding.
+    """
+
+    def __init__(self, every: int = 120):
+        self.every = every
+        self.count = 0
+
+    def tick(self) -> bool:
+        self.count += 1
+        return self.count == 1 or self.count % self.every == 0
+
+
 class KeepAlive(AppKit.NSObject):
     """Idle timer doing two jobs: keep Python bytecode running (SIGINT is
     otherwise deferred forever by the AppKit run loop, which makes Ctrl-C look
@@ -584,6 +602,9 @@ def self_test() -> None:
     assert peak_level(np.zeros(16000, dtype=np.float32), 16000) == 0.0
     quiet = np.full(16000, 0.0003, dtype=np.float32); quiet[8000:8800] = 0.02
     assert peak_level(quiet, 16000) > 0.01, "peak must find the loud part"
+    # log rate limiting: first occurrence prints, then one in every `every`
+    lim = RepeatLimiter(every=4)
+    assert [lim.tick() for _ in range(9)] == [True, False, False, False, True, False, False, False, True]
     assert meter_level(0.0) == 0.0
     assert 0.3 < meter_level(0.02) < 0.7, meter_level(0.02)  # quiet speech still moves
     assert meter_level(0.5) == 1.0  # clamped, never overflows the bar
@@ -709,6 +730,7 @@ def main() -> None:
         | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp)
     )
     held = False
+    tap_warn = RepeatLimiter()
 
     def callback(proxy, type_, event, refcon):
         nonlocal held
@@ -718,7 +740,8 @@ def main() -> None:
         ):
             Quartz.CGEventTapEnable(tap, True)
             held = False  # a disable can swallow the release
-            print(f"! tap disabled by system (0x{type_ & 0xffffffff:x}) — re-armed", flush=True)
+            if tap_warn.tick():
+                print(f"! tap disabled by system (0x{type_ & 0xffffffff:x}) — re-armed", flush=True)
             return event
         code = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
         if code != keycode:
@@ -757,10 +780,16 @@ def main() -> None:
         """Re-arm the tap if the system disabled it behind our back."""
         nonlocal held
         if Quartz.CGEventTapIsEnabled(tap):
+            tap_warn.count = 0  # healthy again; a later failure should print
             return
         Quartz.CGEventTapEnable(tap, True)
         held = False
-        print("! tap found disabled — re-armed", flush=True)
+        if tap_warn.tick():
+            print(
+                f"! tap disabled — re-armed (x{tap_warn.count}). If it never stays enabled,"
+                f" grant Accessibility + Microphone to {os.path.realpath(sys.executable)}",
+                flush=True,
+            )
 
     AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.5, KeepAlive.alloc().initWithCheck_(heartbeat), "noop:", None, True
