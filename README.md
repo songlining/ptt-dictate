@@ -15,7 +15,11 @@ in the pill, at the cost of a hard 3.5s floor before any text can appear.
 
 ## How it works
 
-- A Quartz **listen-only** event tap watches one hotkey (no keystroke swallowed).
+- A Quartz event tap watches one hotkey and **swallows** it, so an app that
+  binds the same key for its own hold-to-talk does not also fire. (some chat apps binds
+  right Option: without swallowing, one key press gives you a voice message *and*
+  the pasted text. a similar tool shipped the same behaviour as `block_keys: True`.)
+  `--key-passthrough` opts out.
 - On press: the mic stream opens on the *current* default input device and audio
   is buffered; the pill appears with a live mic meter.
 - On release, either
@@ -75,6 +79,7 @@ Then hold the key, speak, release.
 | flag | default | notes |
 |------|---------|-------|
 | `--key` | `right_option` | `left_option`, `right_command`, `left_command`, `right_shift`, `left_shift`, `right_control`, `left_control`, `fn`, or `f13`–`f19` |
+| `--key-passthrough` | off | let other apps see the hotkey too. Default (off) swallows it; turning this on costs you nothing functionally but re-introduces double-firing in apps that bind the same key |
 | `--model` | `mlx-community/Qwen3-ASR-1.7B-8bit` | path or HF repo id; streaming checkpoints auto-switch to `--mode stream` |
 | `--mode` | `auto` | `auto` \| `stream` \| `batch`. `auto` streams only for checkpoints with window/chunk metadata |
 | `--context` | `""` | names/jargon. In batch mode these become **real hotwords** (`hotwords=[...]`) when the model supports it. Merges with `--context-file` |
@@ -178,6 +183,13 @@ Editing the script requires a bootout + bootstrap to take effect. Because
 `KeepAlive` restarts it, `kill` is not how you stop it — use `bootout`.
 
 ## Gotchas
+
+- **The hotkey is swallowed, so it is no longer usable as a modifier.** With
+  right Option consumed by the daemon, Option+key on the *right* key no longer
+  types special characters. That is the price of not double-firing in apps with
+  their own hold-to-talk, and it is what a similar tool did too. If you need the modifier
+  back, use `--key-passthrough` and accept the collision — or bind a key nothing
+  else wants (`--key f13`).
 
 - **A Bluetooth headset coming or going changes the default input.** PortAudio
   caches the device list at init and never re-reads it, so a vanished default
