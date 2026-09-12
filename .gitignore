@@ -3,3 +3,13 @@
 .DS_Store
 __pycache__/
 *.plist
+
+# The hotwords list holds real names — your own, colleagues', customers'. It
+# lives in ~/.config/ptt-dictate/, never here, but ignore a stray copy.
+hotwords*.txt
+
+# Audio would be your voice (or a customer's).
+*.wav
+*.m4a
+*.aiff
+*.caf

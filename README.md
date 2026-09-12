@@ -114,11 +114,13 @@ They live in a plain file:
 
 ```
 # one term per line; # starts a comment
-Alex Chen
-Acme Corp
-Terraform
-Vault
+Alex Chen          # your name, colleagues, customers
+Kubernetes
+Postgres
 ```
+
+Names of people and products are the entries that earn their place; anything the
+model already spells correctly is noise.
 
 The file is **re-read on every press**, so editing it applies to your very next
 dictation — no reinstall, no daemon restart. Phrases work (`Vault Radar`);
