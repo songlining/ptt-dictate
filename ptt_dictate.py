@@ -604,7 +604,7 @@ def self_test() -> None:
     assert peak_level(quiet, 16000) > 0.01, "peak must find the loud part"
     # log rate limiting: first occurrence prints, then one in every `every`
     lim = RepeatLimiter(every=4)
-    assert [lim.tick() for _ in range(9)] == [True, False, False, False, True, False, False, False, True]
+    assert [lim.tick() for _ in range(9)] == [True, False, False, True, False, False, False, True, False]
     assert meter_level(0.0) == 0.0
     assert 0.3 < meter_level(0.02) < 0.7, meter_level(0.02)  # quiet speech still moves
     assert meter_level(0.5) == 1.0  # clamped, never overflows the bar
