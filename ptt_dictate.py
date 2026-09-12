@@ -647,6 +647,10 @@ def main() -> None:
     ap.add_argument("--min-rms", type=float, default=0.002,
                     help="batch: log a 'mic muted?' note below this level; still transcribes")
     ap.add_argument("--transcribe-file", default="", help="transcribe a file and exit (smoke test)")
+    ap.add_argument("--key-passthrough", action="store_true",
+                    help="let other apps see the hotkey too (default: we swallow it,"
+                         " so an app with its own hold-to-talk on the same key e.g. some chat apps"
+                         " does not also fire). Costs you the key as a modifier.")
     ap.add_argument("--live-file", default="", help="append live partials to this file")
     ap.add_argument("--tail-ms", type=int, default=200, help="extra mic time after key release")
     ap.add_argument("--device", default=None, help="input device index/name (default: system default)")
@@ -711,8 +715,8 @@ def main() -> None:
                         args.paste_delay, batch, args.min_rms, args.context_file)
     if batch:
         print(
-            f"ready: {args.key} (keycode {keycode}) | BATCH | {recorder.SR}Hz input"
-            f" | transcribes on release",
+            f"ready: {args.key} (keycode {keycode}) | BATCH | {recorder.SR}Hz input | "
+            f"transcribes on release | key {'passed through' if args.key_passthrough else 'swallowed'}",
             flush=True,
         )
     else:
@@ -734,6 +738,11 @@ def main() -> None:
 
     def callback(proxy, type_, event, refcon):
         nonlocal held
+        passthrough = args.key_passthrough
+        if event is None:
+            # A tap ahead of ours deleted this event; there is nothing to read
+            # or return, and CGEventGetIntegerValueField(NULL) segfaults.
+            return None
         if type_ in (
             Quartz.kCGEventTapDisabledByTimeout,
             Quartz.kCGEventTapDisabledByUserInput,
@@ -751,7 +760,9 @@ def main() -> None:
         else:
             down = type_ == Quartz.kCGEventKeyDown
         if down == held:
-            return event
+            # Even a duplicate is swallowed while we own the key, otherwise the
+            # other app sees an unmatched press or release.
+            return event if passthrough else None
         held = down
         if down:
             recorder.press()
@@ -759,12 +770,16 @@ def main() -> None:
             threading.Thread(
                 target=recorder.release, args=(args.tail_ms,), daemon=True
             ).start()
-        return event
+        # Swallow our own hotkey: returning None deletes the event, so apps that
+        # also bind this key never see the press. a similar tool did the same
+        # (`block_keys: True`) — without it some chat apps records a voice message from
+        # the same hold that starts dictation, giving two inputs per utterance.
+        return event if passthrough else None
 
     tap = Quartz.CGEventTapCreate(
         Quartz.kCGSessionEventTap,
         Quartz.kCGHeadInsertEventTap,
-        Quartz.kCGEventTapOptionListenOnly,
+        Quartz.kCGEventTapOptionDefault,  # not ListenOnly: we swallow our hotkey
         mask,
         callback,
         None,
