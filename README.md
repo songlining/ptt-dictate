@@ -20,7 +20,8 @@ in the pill, at the cost of a hard 3.5s floor before any text can appear.
   clients bind right Option for hold-to-talk: without swallowing, one key press
   gives you a voice message *and* the pasted text. Mature dictation tools ship
   the same behaviour, as a `block_keys`-style setting.)
-  `--key-passthrough` opts out.
+  `--key-passthrough` opts out, at the cost of that key no longer working as a
+  modifier.
 - On press: the mic stream opens on the *current* default input device and audio
   is buffered; the pill appears with a live mic meter.
 - On release, either
@@ -41,7 +42,8 @@ speech = bars at ~80%). Click-through, above normal windows, and never takes
 focus from the app you are dictating into.
 
 In batch mode there is no partial text to show — the model only runs on release
-— so the pill is a listening indicator plus the meter.
+— so the pill is a listening indicator plus the meter. It is a fixed 380×44pt
+and truncates long text from the left (`…`), keeping the most recent words.
 
 The process runs as an **accessory** app (no Dock icon, never activated) — so
 the panel needs `setHidesOnDeactivate_(False)` or it flashes on press and
@@ -185,64 +187,45 @@ launchctl bootout gui/$(id -u)/local.ptt-dictate                       # stop on
 Editing the script requires a bootout + bootstrap to take effect. Because
 `KeepAlive` restarts it, `kill` is not how you stop it — use `bootout`.
 
-## Gotchas
+## Troubleshooting
 
-- **The hotkey is swallowed, so it is no longer usable as a modifier.** With
-  right Option consumed by the daemon, Option+key on the *right* key no longer
-  types special characters. That is the price of not double-firing in apps with
-  their own hold-to-talk, and it is what other dictation tools do too. If you need the modifier
-  back, use `--key-passthrough` and accept the collision — or bind a key nothing
-  else wants (`--key f13`).
+Every failure mode here is *silent* — the daemon looks healthy and no text
+appears. Start with the log, `~/Library/Logs/ptt-dictate/daemon.log`: you want
+`● listening` on press and `→ <text>` on release. Anything else is the clue.
 
-- **A Bluetooth headset coming or going changes the default input.** PortAudio
-  caches the device list at init and never re-reads it, so a vanished default
-  device made every press fail with `-10851 Invalid Property Value` and capture
-  silence — which surfaced as a run of `→ (nothing)` with no explanation. The
-  other half of the trap: once the headset returned we would have stayed on the
-  built-in mic forever. A full device re-scan costs ~3ms, so every press now
-  re-scans and opens whatever is *currently* the default input, with one retry
-  after a second re-scan if the open fails. A press that still cannot get a mic
-  aborts with `! mic unavailable — press skipped` instead of pretending, and the
-  log prints `mic: <name>` whenever the device in use changes.
-- **macOS can disable the event tap behind your back** — on callback timeout or
-  during secure input it stops delivering events *silently*: the process looks
-  healthy, idles at 0% CPU, and hears nothing until restarted. Symptom is
-  "it worked, then stopped", which is easy to misdiagnose as a broken key or
-  permission. The callback re-arms on `kCGEventTapDisabledByTimeout` /
-  `...ByUserInput`, and a 0.5s health-check timer (the same one that keeps
-  SIGINT alive) re-arms it if `CGEventTapIsEnabled` says otherwise. Both log
-  `! tap disabled — re-armed` so the next occurrence is visible instead of
-  silent.
-- **Never name a method of an `NSObject` subclass `release`** (or `press`). It
-  shadows `-release`, and since `performSelectorOnMainThread:` retains/releases
-  its receiver, the override re-enters itself forever: a permanent ~100% CPU
-  spin from the instant the object exists — even with the window never created
-  or shown. This cost a long debugging session; the pill methods are `show_pill`
-  / `hide_pill` for that reason.
-- **pyobjc turns EVERY underscore into a colon** when deriving a selector:
-  a method called via `performSelectorOnMainThread_` must map to exactly one
-  colon for one argument (`hideNow_` → `hideNow:`). `do_hide_pill_` becomes
-  `do:hide:pill:` and fails with `BadPrototypeError` at class-creation time.
-  Leading-underscore names (`_build`) are not registered as selectors at all.
-- **Something else on the same key**: only one app can own a hotkey. If a
-dictation or input tool already holds it, quit it and disable its autostart, or
-it takes the key back at next login — check `~/Library/LaunchAgents/` and any
-input-method settings. On macOS the right-Option key is a popular choice, so a
-pre-existing dictation tool is the usual culprit.
-- **Modifier keys and the flag mask**: down/up is read from the event's modifier
-  flags, so holding *both* option keys and releasing only the bound one will not
-  register a release until both are up. Bind a non-modifier (`f13`) if that
-  matters.
-- **Accessibility**: the tap and the Cmd-V post both need it. Granted per
-  interpreter path, so running under a LaunchAgent rather than a terminal may
-  trigger a fresh prompt.
-- **The window protocol matters**: window k must cover `[k*ADV, k*ADV+WIN)`.
-  Feeding a wider overlap makes the model re-transcribe audio it already
-  emitted — that bug is what the `feed`/`flush` split and the self-test guard.
-- **Ctrl-C quits** — via a 0.5s idle timer, because the AppKit run loop would
-  otherwise defer the signal forever and the daemon would look unkillable.
-- **The pill is fixed-size** (380×44pt) and truncates long text from the left
-  (`…` prefix) — the most recent words are the ones worth showing.
+**It worked, then stopped.** macOS disabled the event tap (callback timeout, or
+secure input). The daemon re-arms it automatically and logs
+`! tap disabled — re-armed`; if that line keeps repeating, the interpreter lacks
+Accessibility — see Requirements. Note that idling at 0% CPU is *not* evidence
+it is working; a disabled tap costs nothing.
+
+**The pill appears but no text arrives.** Grep the log for `mic:` and for
+`(very quiet: peak …)`. A capture is transcribed whatever its level — Qwen3-ASR
+returns nothing for room tone rather than inventing words — so silence points at
+the microphone, not the model. Bluetooth headsets come and go, and every press
+re-scans and opens the current system default, logging `mic: <name>` when it
+changes.
+
+**It never reacts to the key.** Accessibility hasn't been granted to the
+interpreter — see Requirements.
+
+**Text arrives twice, or the wrong app reacts.** The hotkey is swallowed by
+design, which exists exactly for this. `--key-passthrough` re-exposes it to any
+app that binds the same key for its own hold-to-talk. If a pre-existing input
+tool owns the key outright, quit it and disable its autostart
+(`~/Library/LaunchAgents/`, input-method settings) or it takes the key back at
+next login.
+
+**It doesn't stop when you release.** For modifier hotkeys the release is read
+from the event's modifier flags, so holding *both* option keys and releasing only
+the bound one won't register until both are up. Bind a non-modifier if that
+matters.
+
+For anyone changing the code rather than running it, three traps are documented
+where they bite rather than here: the streaming window protocol (window k must
+cover `[k*ADV, k*ADV+WIN)`, or the model re-transcribes audio it already
+emitted), never naming an `NSObject` subclass method `release`, and pyobjc
+turning inner underscores into selector colons.
 
 ## Not implemented
 
