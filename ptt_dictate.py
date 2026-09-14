@@ -365,6 +365,8 @@ class Recorder:
         self.parts: list[str] = []
         self.text_so_far = ""
         self.level = 0.0
+        self.transcribe_s = 0.0  # model time, accumulated by the worker thread
+        self.t_release = 0.0
         self.state = None
         self.stop = threading.Event()
 
@@ -421,7 +423,9 @@ class Recorder:
             # Informational only — we still transcribe. Blocking here is how a
             # quiet speaker ends up with "stopped working".
             print(f"  (very quiet: peak {peak:.4f} — mic muted?)", flush=True)
+        t0 = time.perf_counter()
         out = self.model.generate(self.buf, **self._bias_kwargs())
+        self.transcribe_s += time.perf_counter() - t0
         piece = clean(result_text(out))
         if piece:
             self.parts.append(piece)
@@ -436,7 +440,9 @@ class Recorder:
         if window.size < self.WIN:
             window = np.pad(window, (0, self.WIN - window.size))  # pad the tail, not the head
         features = self.model.encode_speech(mx.array(window)[None, :])
+        t0 = time.perf_counter()
         text, self.state = self.model.streaming_generate_step(features, self.state)
+        self.transcribe_s += time.perf_counter() - t0
         self.steps += 1
         piece = clean(text)
         if piece:
@@ -527,15 +533,30 @@ class Recorder:
                 return
             self.active = False
             self.busy = True
+        self.t_release = time.perf_counter()
         try:
             time.sleep(tail_ms / 1000)  # catch the last syllable before the mic closes
             self.stream.stop()
             self.stream.close()
+            t_capture = time.perf_counter()  # audio fully captured from here
             self.stop.set()
             self.thread.join()
             text = clean(" ".join(self.parts))
             if text:
-                print(f"→ {text}", flush=True)
+                print(
+                    f"→ {text}",
+                    flush=True,
+                )
+                # Latency breakdown: how much of the wait was capture overhead vs
+                # the model. Long utterances legitimately cost more in batch mode,
+                # so this is the number to watch when it feels slow.
+                print(
+                    f"  [release→text {time.perf_counter() - self.t_release:.2f}s"
+                    f" = capture {t_capture - self.t_release:.2f}s"
+                    f" + transcribe {self.transcribe_s:.2f}s"
+                    f" + paste {time.perf_counter() - t_capture - self.transcribe_s:.2f}s]",
+                    flush=True,
+                )
                 if not self.dry_run:
                     paste(text, self.paste_delay)
             else:
