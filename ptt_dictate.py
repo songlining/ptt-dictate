@@ -336,10 +336,11 @@ def paste(text: str, restore_delay: float = 0.6) -> None:
 class Recorder:
     """One press-to-release dictation cycle against a loaded ASR model."""
 
-    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6, batch: bool = False, min_rms: float = 0.005, context_file: str = ""):
+    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6, batch: bool = False, min_rms: float = 0.005, context_file: str = "", prewarm: bool = True):
         self.model = model
         self.context = context
         self.context_file = context_file
+        self.prewarm = prewarm
         self.live_file = live_file
         self.dry_run = dry_run
         self.device = device
@@ -525,7 +526,32 @@ class Recorder:
             return
         if self.overlay is not None:
             self.overlay.show_pill()
+        # Fault the weights back into RAM while the user is still speaking.
+        # After a long idle spell macOS compresses the model (~2.4GB: resident
+        # has been measured at 0.10GB), and the release-time transcribe would
+        # otherwise pay seconds of page-in before producing anything. This runs
+        # concurrently with the user talking, so the only visible cost is a
+        # short GPU burst that no one is waiting on.
+        if self.prewarm:
+            threading.Thread(target=self._prewarm, daemon=True).start()
         print("● listening", flush=True)
+
+    def _prewarm(self) -> None:
+        """One tiny forward pass, purely so the pages are resident by release."""
+        try:
+            t0 = time.perf_counter()
+            self.model.generate(self._silence())
+            took = time.perf_counter() - t0
+            if took > 0.25:  # only worth reporting when it actually paged in
+                print(f"  (prewarm {took:.1f}s — model had been evicted)", flush=True)
+        except Exception as exc:  # never let a warm-up break a dictation
+            print(f"  (prewarm failed: {exc!r})", flush=True)
+
+    def _silence(self) -> np.ndarray:
+        """1s of silence to warm on (models pad short inputs internally)."""
+        if not hasattr(self, "_silence_buf"):
+            self._silence_buf = np.zeros(self.SR, dtype=np.float32)
+        return self._silence_buf
 
     def release(self, tail_ms: int = 200) -> None:
         with self.lock:
@@ -679,6 +705,8 @@ def main() -> None:
     ap.add_argument("--paste-delay", type=float, default=0.6, help="seconds before the old clipboard is restored")
     ap.add_argument("--no-overlay", action="store_true", help="skip the floating status pill")
     ap.add_argument("--overlay-text", default="直接说", help="pill text while waiting for speech")
+    ap.add_argument("--no-prewarm", action="store_true",
+                    help="skip the on-press warm-up that hides a compressed model's page-in")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
@@ -733,7 +761,7 @@ def main() -> None:
         signal.signal(sig, lambda *_: os._exit(0))
     overlay = None if args.no_overlay else Overlay.alloc().initWithPrompt_(args.overlay_text)
     recorder = Recorder(model, args.context, args.live_file, args.dry_run, args.device, overlay,
-                        args.paste_delay, batch, args.min_rms, args.context_file)
+                        args.paste_delay, batch, args.min_rms, args.context_file, not args.no_prewarm)
     if batch:
         print(
             f"ready: {args.key} (keycode {keycode}) | BATCH | {recorder.SR}Hz input | "
