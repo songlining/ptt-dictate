@@ -3,8 +3,10 @@
 Hold-to-talk dictation on a local ASR model via MLX — hold the key, speak,
 release, and the text lands in whatever app has focus.
 
-One warm daemon, no cloud round-trip, ~0.3–0.5s from key release to pasted
-text, plus a floating status pill while you speak.
+One warm daemon, no cloud round-trip. Release→text is ~0.4s for a short phrase
+and grows with how long you speak (~1.2s after 20s of continuous dictation),
+because the whole utterance is transcribed on release. Plus a floating status
+pill while you speak.
 
 Default model is **Qwen3-ASR-1.7B** (8-bit MLX) in **batch** mode: the whole
 utterance is transcribed once on release. That is both more accurate and faster
@@ -26,7 +28,7 @@ in the pill, at the cost of a hard 3.5s floor before any text can appear.
   is buffered; the pill appears with a live mic meter.
 - On release, either
   - **batch** (default): one `model.generate()` call over the buffered utterance
-    (~0.3–0.5s for a 10s clip), or
+    (~0.7s for a 10s clip, scaling with utterance length), or
   - **streaming** (`--mode stream`): a final padded step on the tail, with
     partials printed/shown as 2.93s windows land while you speak.
 - The text is then put on the clipboard, Cmd-V is posted, and the previous
