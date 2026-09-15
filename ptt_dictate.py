@@ -784,6 +784,7 @@ def main() -> None:
     )
     held = False
     tap_warn = RepeatLimiter()
+    up_ticks = {"n": 0}  # consecutive heartbeat ticks seeing the key physically up
 
     def callback(proxy, type_, event, refcon):
         nonlocal held
@@ -841,19 +842,36 @@ def main() -> None:
     Quartz.CGEventTapEnable(tap, True)
 
     def heartbeat() -> None:
-        """Re-arm the tap if the system disabled it behind our back."""
+        """Re-arm the tap, and finish a press whose release went missing."""
         nonlocal held
-        if Quartz.CGEventTapIsEnabled(tap):
+        if not Quartz.CGEventTapIsEnabled(tap):
+            Quartz.CGEventTapEnable(tap, True)
+            held = False
+            if tap_warn.tick():
+                print(
+                    f"! tap disabled — re-armed (x{tap_warn.count}). If it never stays enabled,"
+                    f" grant Accessibility + Microphone to {os.path.realpath(sys.executable)}",
+                    flush=True,
+                )
+        else:
             tap_warn.count = 0  # healthy again; a later failure should print
-            return
-        Quartz.CGEventTapEnable(tap, True)
-        held = False
-        if tap_warn.tick():
-            print(
-                f"! tap disabled — re-armed (x{tap_warn.count}). If it never stays enabled,"
-                f" grant Accessibility + Microphone to {os.path.realpath(sys.executable)}",
-                flush=True,
-            )
+        # A disable mid-press, or any dropped event, loses the release: `active`
+        # then stays set forever — pill on screen, hotkey dead until a restart.
+        # The key is physically up or it is not, so ask the hardware rather than
+        # wait for an event that may never arrive.
+        if recorder.active and not Quartz.CGEventSourceKeyState(
+            Quartz.kCGEventSourceStateHIDSystemState, keycode
+        ):
+            up_ticks["n"] += 1
+            if up_ticks["n"] >= 2:  # two consecutive ticks, to ride out a lag
+                up_ticks["n"] = 0
+                held = False
+                print("! release event was lost — ending the press", flush=True)
+                threading.Thread(
+                    target=recorder.release, args=(args.tail_ms,), daemon=True
+                ).start()
+        else:
+            up_ticks["n"] = 0
 
     AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.5, KeepAlive.alloc().initWithCheck_(heartbeat), "noop:", None, True
