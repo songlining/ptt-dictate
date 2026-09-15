@@ -175,13 +175,14 @@ class RepeatLimiter:
     every `every` ticks, so the state stays visible without flooding.
     """
 
-    def __init__(self, every: int = 120):
+    def __init__(self, every: int = 120, first: int = 1):
         self.every = every
+        self.first = first
         self.count = 0
 
     def tick(self) -> bool:
         self.count += 1
-        return self.count == 1 or self.count % self.every == 0
+        return self.count <= self.first or self.count % self.every == 0
 
 
 class KeepAlive(AppKit.NSObject):
@@ -368,6 +369,7 @@ class Recorder:
         self.level = 0.0
         self.transcribe_s = 0.0  # model time, accumulated by the worker thread
         self.t_release = 0.0
+        self.t_press = 0.0
         self.state = None
         self.stop = threading.Event()
 
@@ -501,6 +503,7 @@ class Recorder:
                 return
             self.active = True
         self.reset()
+        self.t_press = time.perf_counter()
         # Batch models have no streaming state to prefill (nor init_streaming_state).
         if self.batch:
             self.state = None
@@ -783,8 +786,24 @@ def main() -> None:
         | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp)
     )
     held = False
-    tap_warn = RepeatLimiter()
-    up_ticks = {"n": 0}  # consecutive heartbeat ticks seeing the key physically up
+    tap_warn = RepeatLimiter(first=3)  # see the first few disables, then rate-limit
+
+    def end_press(reason: str) -> None:
+        """End whatever press is in flight.
+
+        Called on a release, and also when we know events were dropped. Resetting
+        `held` alone is not enough — and actively harmful: the real release then
+        looks like a duplicate and is ignored, leaving `active` set, the pill on
+        screen and the hotkey dead until a restart.
+        """
+        nonlocal held
+        held = False
+        if recorder.active:
+            if reason != "release":
+                print(f"! {reason} — ending the press", flush=True)
+            threading.Thread(
+                target=recorder.release, args=(args.tail_ms,), daemon=True
+            ).start()
 
     def callback(proxy, type_, event, refcon):
         nonlocal held
@@ -798,9 +817,13 @@ def main() -> None:
             Quartz.kCGEventTapDisabledByUserInput,
         ):
             Quartz.CGEventTapEnable(tap, True)
-            held = False  # a disable can swallow the release
             if tap_warn.tick():
-                print(f"! tap disabled by system (0x{type_ & 0xffffffff:x}) — re-armed", flush=True)
+                print(
+                    f"! tap disabled by system (0x{type_ & 0xffffffff:x}) — re-armed"
+                    f" (x{tap_warn.count})",
+                    flush=True,
+                )
+            end_press("tap disabled by system")
             return event
         code = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
         if code != keycode:
@@ -809,17 +832,12 @@ def main() -> None:
             down = bool(Quartz.CGEventGetFlags(event) & flag)
         else:
             down = type_ == Quartz.kCGEventKeyDown
-        if down == held:
-            # Even a duplicate is swallowed while we own the key, otherwise the
-            # other app sees an unmatched press or release.
-            return event if passthrough else None
-        held = down
         if down:
-            recorder.press()
-        else:
-            threading.Thread(
-                target=recorder.release, args=(args.tail_ms,), daemon=True
-            ).start()
+            if not held:
+                held = True
+                recorder.press()
+        elif held or recorder.active:
+            end_press("release")
         # Swallow our own hotkey: returning None deletes the event, so apps that
         # also bind this key never see the press. Without it, an app with its own
         # hold-to-talk records a voice message from the same hold that starts
@@ -842,36 +860,21 @@ def main() -> None:
     Quartz.CGEventTapEnable(tap, True)
 
     def heartbeat() -> None:
-        """Re-arm the tap, and finish a press whose release went missing."""
-        nonlocal held
+        """Keep the tap armed, and never leave a press stuck forever."""
         if not Quartz.CGEventTapIsEnabled(tap):
             Quartz.CGEventTapEnable(tap, True)
-            held = False
             if tap_warn.tick():
                 print(
-                    f"! tap disabled — re-armed (x{tap_warn.count}). If it never stays enabled,"
-                    f" grant Accessibility + Microphone to {os.path.realpath(sys.executable)}",
+                    f"! tap found disabled — re-armed (x{tap_warn.count}). If it never stays"
+                    f" enabled, grant Accessibility + Microphone to"
+                    f" {os.path.realpath(sys.executable)}",
                     flush=True,
                 )
-        else:
-            tap_warn.count = 0  # healthy again; a later failure should print
-        # A disable mid-press, or any dropped event, loses the release: `active`
-        # then stays set forever — pill on screen, hotkey dead until a restart.
-        # The key is physically up or it is not, so ask the hardware rather than
-        # wait for an event that may never arrive.
-        if recorder.active and not Quartz.CGEventSourceKeyState(
-            Quartz.kCGEventSourceStateHIDSystemState, keycode
-        ):
-            up_ticks["n"] += 1
-            if up_ticks["n"] >= 2:  # two consecutive ticks, to ride out a lag
-                up_ticks["n"] = 0
-                held = False
-                print("! release event was lost — ending the press", flush=True)
-                threading.Thread(
-                    target=recorder.release, args=(args.tail_ms,), daemon=True
-                ).start()
-        else:
-            up_ticks["n"] = 0
+            end_press("tap found disabled")
+        elif recorder.active and time.perf_counter() - recorder.t_press > 300:
+            # Last-resort valve. A release lost with no disable notification has
+            # no other signal, and a stuck press means a dead hotkey.
+            end_press("press exceeded 5 minutes")
 
     AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.5, KeepAlive.alloc().initWithCheck_(heartbeat), "noop:", None, True
