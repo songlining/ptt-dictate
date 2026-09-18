@@ -18,7 +18,9 @@ utterance is transcribed once on release. That is both more accurate and faster
 than a streaming model for push-to-talk, because nothing has to wait for a
 fixed audio window to fill. **Streaming** models (VibeVoice-ASR-Streaming) are
 still supported via `--mode stream` — they trade accuracy for live partial text
-in the pill, at the cost of a hard 3.5s floor before any text can appear.
+in the pill, at the cost of a hard ~3.5s floor before the *first* text can appear
+(the model needs a full 3.47s window before it can emit anything, and after that
+partials land every 2.93s).
 
 ## How it works
 
@@ -154,7 +156,7 @@ say is unlikely to help.
 | 10.3s Chinese | **0.46s** (22×) | 0.24s (44×) | 1.23s (8×) | 2.54s (4×) |
 | 20s English | 0.96s (21×) | 0.47s (42×) | 2.23s (9×) | 4.98s (4×) |
 | 5s utterance, warm | 0.31s | 0.15s | 0.72s | 2.49s |
-| live partials | no | no | yes (from ~3.5s) | yes |
+| live partials | no | no | yes (first at ~3.5s, then every 2.93s) | yes |
 | input rate | 16 kHz | 16 kHz | 24 kHz | 24 kHz |
 
 Accuracy on the same audio: Qwen 1.7B got every technical term right
