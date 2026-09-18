@@ -458,9 +458,12 @@ class Recorder:
 
     def _close_stream(self) -> None:
         """Teardown, on its own thread so a HAL stall cannot hang the release."""
+        stream = getattr(self, "stream", None)
+        if stream is None:
+            return  # the open never completed
         try:
-            self.stream.stop()
-            self.stream.close()
+            stream.stop()
+            stream.close()
         except Exception as exc:
             print(f"  (stream close failed: {exc!r})", flush=True)
 
@@ -498,6 +501,10 @@ class Recorder:
                     callback=self._on_audio,
                 )
                 self.stream.start()
+                if self.stop.is_set():
+                    # Released before the open completed: don't leave a live mic.
+                    self.stream.stop()
+                    self.stream.close()
                 return
             except Exception as exc:
                 if attempt == 2:
@@ -525,17 +532,6 @@ class Recorder:
         self.q: queue.Queue = queue.Queue()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
-        try:
-            self._open_stream()
-        except Exception as exc:
-            # Abort cleanly: never leave `active` set (which would swallow the
-            # release) and never report the silence as an empty transcription.
-            print(f"! mic unavailable — press skipped: {exc}", flush=True)
-            self.stop.set()
-            self.thread.join()
-            with self.lock:
-                self.active = False
-            return
         if self.overlay is not None:
             self.overlay.show_pill()
         # Fault the weights back into RAM while the user is still speaking.
@@ -546,7 +542,36 @@ class Recorder:
         # short GPU burst that no one is waiting on.
         if self.prewarm:
             threading.Thread(target=self._prewarm, daemon=True).start()
+        # The mic OPEN must not run here. This is the event-tap callback, i.e. the
+        # main thread, and PortAudio's open can block on a CoreAudio HAL mutex
+        # (observed: Pa_OpenStream -> HALB_Mutex::Lock). Blocking the main thread
+        # froze the pill, the timers and every later keypress — the daemon went
+        # deaf with no log line. Open on a worker, and bound it.
+        self._opened = threading.Event()
+        threading.Thread(target=self._open_bounded, daemon=True).start()
+        threading.Thread(target=self._open_watchdog, daemon=True).start()
         print("● listening", flush=True)
+
+    def _open_bounded(self) -> None:
+        """Open the mic on a worker thread; failure aborts the capture, nothing more."""
+        try:
+            self._open_stream()
+        except Exception as exc:
+            print(f"! mic unavailable — press skipped: {exc}", flush=True)
+            self.stop.set()
+        finally:
+            self._opened.set()
+
+    def _open_watchdog(self) -> None:
+        """A wedged open leaves CoreAudio unusable, so restart for a clean HAL."""
+        if self._opened.wait(timeout=6.0):
+            return
+        print(
+            "! mic open wedged (audio subsystem stalled) — restarting for a clean state",
+            flush=True,
+        )
+        time.sleep(0.2)  # let the line above reach the log
+        os._exit(0)  # launchd KeepAlive brings us back with fresh audio
 
     def _prewarm(self) -> None:
         """One tiny forward pass, purely so the pages are resident by release."""
@@ -572,8 +597,11 @@ class Recorder:
             self.active = False
             self.busy = True
         self.t_release = time.perf_counter()
+        wedged = False
         try:
             time.sleep(tail_ms / 1000)  # catch the last syllable before the mic closes
+            if getattr(self, "_opened", None) is not None:
+                self._opened.wait(timeout=1.0)  # a press can end before the open did
             # PortAudio's stop/close can block inside CoreAudio while the device
             # is being changed underneath us (seen waiting on a HAL mutex in
             # HAL_HardwarePlugIn_DeviceStop). Bound it: a wedged teardown must
@@ -582,8 +610,9 @@ class Recorder:
             closer = threading.Thread(target=self._close_stream, daemon=True)
             closer.start()
             closer.join(timeout=2.0)
-            if closer.is_alive():
-                print("! audio teardown wedged (device changing?) — carrying on", flush=True)
+            wedged = closer.is_alive()
+            if wedged:
+                print("! audio teardown wedged — audio subsystem is poisoned", flush=True)
             t_capture = time.perf_counter()  # audio fully captured from here
             self.stop.set()
             self.thread.join()
@@ -614,6 +643,14 @@ class Recorder:
                 self.overlay.hide_pill()
             with self.lock:
                 self.busy = False
+            if wedged:
+                # PortAudio is stuck holding a CoreAudio HAL mutex; the next open
+                # would block on it forever — that is how the daemon went deaf.
+                # The text is already pasted, so hand over to launchd for a clean
+                # audio subsystem instead of limping on.
+                print("  (restarting for a clean audio subsystem)", flush=True)
+                time.sleep(0.3)
+                os._exit(0)
 
     def _run(self) -> None:
         while not self.stop.is_set():
