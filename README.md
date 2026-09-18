@@ -3,10 +3,15 @@
 Hold-to-talk dictation on a local ASR model via MLX — hold the key, speak,
 release, and the text lands in whatever app has focus.
 
-One warm daemon, no cloud round-trip. Release→text is ~0.4s for a short phrase
-and grows with how long you speak (~1.2s after 20s of continuous dictation),
-because the whole utterance is transcribed on release. Plus a floating status
-pill while you speak.
+One warm daemon, no cloud round-trip. Release→paste is typically ~0.6–0.8s for a
+short phrase and grows with how long you speak (~1.2s after 20s of continuous
+dictation), because the whole utterance is transcribed on release. Plus a
+floating status pill while you speak.
+
+(Measured with the repo's own log line, `[release→paste …]`, on an M4 Pro. The
+four-model table further down quotes **transcribe time only** — it excludes the
+200ms tail, the audio teardown and the paste, so a model's row is not the
+user-visible latency.)
 
 Default model is **Qwen3-ASR-1.7B** (8-bit MLX) in **batch** mode: the whole
 utterance is transcribed once on release. That is both more accurate and faster
@@ -33,7 +38,8 @@ in the pill, at the cost of a hard 3.5s floor before any text can appear.
     partials printed/shown as 2.93s windows land while you speak.
 - The text is then put on the clipboard, Cmd-V is posted, and the previous
   clipboard is restored. Clipboard-based because CGEvent keyboard injection
-  cannot type Chinese.
+  cannot reliably type CJK in every target, whereas a paste uses the app's own
+  input path.
 
 ### The status pill
 
@@ -84,12 +90,12 @@ Then hold the key, speak, release.
 | flag | default | notes |
 |------|---------|-------|
 | `--key` | `right_option` | `left_option`, `right_command`, `left_command`, `right_shift`, `left_shift`, `right_control`, `left_control`, `fn`, or `f13`–`f19` |
-| `--key-passthrough` | off | let other apps see the hotkey too. Default (off) swallows it; turning this on costs you nothing functionally but re-introduces double-firing in apps that bind the same key |
+| `--key-passthrough` | off | let other apps see the hotkey too. The default (off) swallows it, which is what stops a chat app's own hold-to-talk double-firing — but swallowing is also what costs you right Option as a modifier. Passthrough restores the modifier and re-exposes the collision |
 | `--model` | `mlx-community/Qwen3-ASR-1.7B-8bit` | path or HF repo id; streaming checkpoints auto-switch to `--mode stream` |
 | `--mode` | `auto` | `auto` \| `stream` \| `batch`. `auto` streams only for checkpoints with window/chunk metadata |
 | `--context` | `""` | names/jargon. In batch mode these become **real hotwords** (`hotwords=[...]`) when the model supports it. Merges with `--context-file` |
 | `--context-file` | `""` | file of hotwords, **re-read on every press** so edits apply without a restart |
-| `--min-rms` | `0.002` | batch: skip a capture whose loudest 100ms is below this. Catches a muted mic; deliberately low so a quietly-spoken word is never dropped |
+| `--min-rms` | `0.002` | batch: **log** a `mic muted?` note when the loudest 100ms is below this. It does not skip anything — nothing is gated on loudness (see Troubleshooting) |
 | `--transcribe-file` | `""` | transcribe a file and exit — smoke test, needs no hotkey and may run alongside the daemon |
 | `--live-file` | `""` | append live partials to a file |
 | `--tail-ms` | `200` | extra mic time after release, to catch the last syllable |
@@ -118,14 +124,16 @@ They live in a plain file:
 ```
 
 ```
-# one term per line; # starts a comment
-Alex Chen          # your name, colleagues, customers
+# one term per line; a line starting with # is a comment
+Alex Chen
 Kubernetes
 Postgres
 ```
 
 Names of people and products are the entries that earn their place; anything the
-model already spells correctly is noise.
+model already spells correctly is noise. (`Alex Chen` is a placeholder — use your
+own name, colleagues, customers. Full-line comments only, so a term containing
+`#` such as `C#` survives.)
 
 The file is **re-read on every press**, so editing it applies to your very next
 dictation — no reinstall, no daemon restart. Phrases work (`Vault Radar`);
@@ -162,8 +170,10 @@ measured first-step times across three consecutive presses were 0.36/0.36/0.38s
 (1.5B) and 0.88/0.88/1.00s (7B).
 
 On silence: Qwen3-ASR returns an empty string for both digital silence and room
-tone, so it invents nothing on a stray tap. Whisper-class models do hallucinate,
-which is why the cheap `--min-rms` gate exists.
+tone, so it invents nothing on a stray tap (observed repeatedly, not proven as a
+guarantee — a loud room could still produce words, which is why `--min-rms` logs
+a warning rather than enforcing one). Whisper-class models are known to
+hallucinate, hence the belt-and-braces note.
 
 Text handling: the streaming models prefix chunks with `Speaker 0:` and emit
 `[Silence]`/`[Noise]` markers — both are stripped, and nothing is pasted when the
@@ -204,9 +214,9 @@ it is working; a disabled tap costs nothing.
 **The pill appears but no text arrives.** Grep the log for `mic:` and for
 `(very quiet: peak …)`. A capture is transcribed whatever its level — Qwen3-ASR
 returns nothing for room tone rather than inventing words — so silence points at
-the microphone, not the model. Bluetooth headsets come and go, and every press
-re-scans and opens the current system default, logging `mic: <name>` when it
-changes.
+the microphone, not the model. Bluetooth headsets come and go: a failed open
+re-scans the device list, and an idle loop re-scans every ~30s so a reconnected
+headset becomes the default again. The log prints `mic: <name>` when it changes.
 
 **It never reacts to the key.** Accessibility hasn't been granted to the
 interpreter — see Requirements.

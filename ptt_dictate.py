@@ -85,16 +85,19 @@ def _dedupe(words: list[str]) -> list[str]:
 
 
 def parse_hotwords(text: str) -> list[str]:
-    """Hotwords from newline- or comma-separated text; `#` comments out the
-    rest of a line.
+    """Hotwords from newline- or comma-separated text; a line starting with `#`
+    is a comment.
 
+    Only a *leading* `#` comments a line, so terms containing it survive (`C#`).
     Splitting stops at commas and newlines — *not* whitespace — so a term may be
     a phrase ("Vault Radar", "Alex Chen") rather than being torn into two
     independent words.
     """
     words = []
     for line in text.splitlines():
-        words += [w.strip() for w in line.split("#", 1)[0].split(",")]
+        if line.lstrip().startswith("#"):
+            continue  # whole-line comment
+        words += [w.strip() for w in line.split(",")]
     return _dedupe([w for w in words if w])
 
 
@@ -125,15 +128,18 @@ def peak_level(buf: np.ndarray, sr: int, block: float = 0.1) -> float:
     return float(np.sqrt(np.mean(np.square(usable), axis=1)).max())
 
 
-def too_short(buf: np.ndarray, sr: int, min_seconds: float = 0.3) -> bool:
+def too_short(buf: np.ndarray, sr: int, min_seconds: float = 0.15) -> bool:
     """A mis-tap, not worth a model run.
 
-    This is the *only* capture that gets skipped. There deliberately is no
-    loudness gate: measured, Qwen3-ASR returns '' for digital silence and for
-    room tone, so the model is its own authority on whether there was speech —
-    and a level threshold cannot separate "mic muted" from "spoken quietly",
-    which meant it silently ate real dictation once the input gain dropped.
-    Loudness is logged instead of enforced.
+    0.15s, not 0.3s: a crisp "yes" or "no" is ~0.2-0.25s, and Qwen pads short
+    inputs internally (its own `min_chunk_duration=1.0`), so the higher threshold
+    was discarding real utterances to reject mis-taps it barely caught.
+
+    There deliberately is no loudness gate either: measured, Qwen3-ASR returns ''
+    for digital silence and for room tone, so the model is its own authority on
+    whether there was speech — and a level threshold cannot separate "mic muted"
+    from "spoken quietly", which meant it silently ate real dictation once the
+    input gain dropped. Loudness is logged instead of enforced.
     """
     return buf.size < sr * min_seconds
 
@@ -314,8 +320,13 @@ class Overlay(AppKit.NSObject):
         self.label.setStringValue_(ellipsize(text or self.prompt))
 
 
-def paste(text: str, restore_delay: float = 0.6) -> None:
-    """Put `text` on the clipboard, hit Cmd-V, then restore the old clipboard."""
+def paste_start(text: str):
+    """Put `text` on the clipboard and post Cmd-V.
+
+    Returns the previous clipboard text, which the caller restores *after* freeing
+    the hotkey: the restore delay is a courtesy to slow target apps and must never
+    hold the next press off.
+    """
     pb = AppKit.NSPasteboard.generalPasteboard()
     previous = pb.stringForType_(AppKit.NSPasteboardTypeString)
     pb.clearContents()
@@ -325,20 +336,30 @@ def paste(text: str, restore_delay: float = 0.6) -> None:
         event = Quartz.CGEventCreateKeyboardEvent(src, 9, down)  # 9 = 'v'
         Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-    # ponytail: fixed delay — the target app reads the pasteboard asynchronously,
-    # so a slow app would paste the restored *old* contents. Raise --paste-delay
-    # if that ever shows up; there is no "did you read it?" hook to poll.
-    time.sleep(restore_delay)
-    if previous is not None:
-        pb.clearContents()
-        pb.setString_forType_(previous, AppKit.NSPasteboardTypeString)
+    return previous
+
+
+def paste_restore(previous, delay: float) -> None:
+    """Put the old clipboard contents back once the target app has read ours.
+
+    ponytail: fixed delay — the app reads the pasteboard asynchronously, so a slow
+    one would see the restored contents instead. Raise --paste-delay if that shows
+    up; there is no "did you read it?" hook to poll.
+    """
+    if previous is None or not delay:
+        return
+    time.sleep(delay)
+    pb = AppKit.NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    pb.setString_forType_(previous, AppKit.NSPasteboardTypeString)
 
 
 class Recorder:
     """One press-to-release dictation cycle against a loaded ASR model."""
 
-    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6, batch: bool = False, min_rms: float = 0.005, context_file: str = "", prewarm: bool = True):
+    def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6, batch: bool = False, min_rms: float = 0.002, context_file: str = "", prewarm: bool = True):
         self.model = model
+        self.t_last_transcribe = 0.0  # gates the prewarm; never reset per press
         self.context = context
         self.context_file = context_file
         self.prewarm = prewarm
@@ -371,6 +392,7 @@ class Recorder:
         self.t_release = 0.0
         self.t_press = 0.0
         self.state = None
+        self.stream = None  # a previous press's stream is gone; never close it again
         self.stop = threading.Event()
 
     def feed(self, chunk: np.ndarray) -> None:
@@ -429,6 +451,7 @@ class Recorder:
         t0 = time.perf_counter()
         out = self.model.generate(self.buf, **self._bias_kwargs())
         self.transcribe_s += time.perf_counter() - t0
+        self.t_last_transcribe = time.perf_counter()
         piece = clean(result_text(out))
         if piece:
             self.parts.append(piece)
@@ -464,6 +487,7 @@ class Recorder:
         try:
             stream.stop()
             stream.close()
+            self.stream = None
         except Exception as exc:
             print(f"  (stream close failed: {exc!r})", flush=True)
 
@@ -510,6 +534,12 @@ class Recorder:
                 if attempt == 2:
                     raise
                 print(f"! mic open failed ({exc}) — re-scanning audio devices", flush=True)
+                try:  # don't leak the failed attempt before retrying
+                    if self.stream is not None:
+                        self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
                 sd._terminate()
                 sd._initialize()
 
@@ -540,7 +570,10 @@ class Recorder:
         # otherwise pay seconds of page-in before producing anything. This runs
         # concurrently with the user talking, so the only visible cost is a
         # short GPU burst that no one is waiting on.
-        if self.prewarm:
+        # Only worth it after an idle spell. If we transcribed recently the pages
+        # are resident anyway, and an unnecessary generate() would compete with the
+        # real one for the GPU — which can *add* latency to a short press.
+        if self.prewarm and time.perf_counter() - self.t_last_transcribe > 60:
             threading.Thread(target=self._prewarm, daemon=True).start()
         # The mic OPEN must not run here. This is the event-tap callback, i.e. the
         # main thread, and PortAudio's open can block on a CoreAudio HAL mutex
@@ -604,38 +637,39 @@ class Recorder:
                 self._opened.wait(timeout=1.0)  # a press can end before the open did
             # PortAudio's stop/close can block inside CoreAudio while the device
             # is being changed underneath us (seen waiting on a HAL mutex in
-            # HAL_HardwarePlugIn_DeviceStop). Bound it: a wedged teardown must
-            # never leave the pill on screen or swallow the transcription.
-            self.stop.set()
+            # HAL_HardwarePlugIn_DeviceStop). Bound it, and set `stop` only once
+            # the mic is closed, so the worker's transcribe cannot overlap capture
+            # — overlapping is why the latency line below used to not add up.
             closer = threading.Thread(target=self._close_stream, daemon=True)
             closer.start()
             closer.join(timeout=2.0)
             wedged = closer.is_alive()
             if wedged:
                 print("! audio teardown wedged — audio subsystem is poisoned", flush=True)
-            t_capture = time.perf_counter()  # audio fully captured from here
             self.stop.set()
+            t_capture = time.perf_counter()  # audio fully captured from here
             self.thread.join()
             text = clean(" ".join(self.parts))
-            if text:
+            if not text:
+                print("→ (nothing)", flush=True)
+            else:
+                print(f"→ {text}", flush=True)
+                t0 = time.perf_counter()
+                previous = None if self.dry_run else paste_start(text)
+                t1 = time.perf_counter()
+                # Free the hotkey the instant the paste has been posted. Holding it
+                # through the clipboard-restore delay (~0.6s) turned every
+                # back-to-back dictation into a silent no-op: no pill, no log.
+                with self.lock:
+                    self.busy = False
                 print(
-                    f"→ {text}",
-                    flush=True,
-                )
-                # Latency breakdown: how much of the wait was capture overhead vs
-                # the model. Long utterances legitimately cost more in batch mode,
-                # so this is the number to watch when it feels slow.
-                print(
-                    f"  [release→text {time.perf_counter() - self.t_release:.2f}s"
+                    f"  [release→paste {t1 - self.t_release:.2f}s"
                     f" = capture {t_capture - self.t_release:.2f}s"
                     f" + transcribe {self.transcribe_s:.2f}s"
-                    f" + paste {time.perf_counter() - t_capture - self.transcribe_s:.2f}s]",
+                    f" + paste {t1 - t0:.2f}s]",
                     flush=True,
                 )
-                if not self.dry_run:
-                    paste(text, self.paste_delay)
-            else:
-                print("→ (nothing)", flush=True)
+                paste_restore(previous, self.paste_delay)
         except Exception as exc:  # keep the daemon alive through a bad cycle
             print(f"release failed: {exc!r}", flush=True)
         finally:
@@ -701,8 +735,9 @@ def self_test() -> None:
     # a phrase must survive as one term, not be split into independent words
     assert parse_hotwords("Alex Chen\nVault Radar") == ["Alex Chen", "Vault Radar"]
     # a mis-tap is skipped; loudness never blocks a transcription
-    assert too_short(np.zeros(4000, dtype=np.float32), 16000) is True    # 0.25s
+    assert too_short(np.zeros(1600, dtype=np.float32), 16000) is True    # 0.10s
     assert too_short(np.zeros(16000, dtype=np.float32), 16000) is False  # 1s
+    assert too_short(np.zeros(4000, dtype=np.float32), 16000) is False   # 0.25s = a real "yes"
     assert peak_level(np.zeros(16000, dtype=np.float32), 16000) == 0.0
     quiet = np.full(16000, 0.0003, dtype=np.float32); quiet[8000:8800] = 0.02
     assert peak_level(quiet, 16000) > 0.01, "peak must find the loud part"
@@ -942,7 +977,10 @@ def main() -> None:
     def refresh_devices() -> None:
         if refreshing["busy"]:
             return
-        refreshing["busy"] = True
+        with recorder.lock:  # a press may have started while we were spawned
+            if recorder.active or recorder.busy:
+                return
+            refreshing["busy"] = True
         try:
             sd._terminate()
             sd._initialize()
