@@ -456,6 +456,14 @@ class Recorder:
                 with open(self.live_file, "a") as fh:
                     fh.write(piece + "\n")
 
+    def _close_stream(self) -> None:
+        """Teardown, on its own thread so a HAL stall cannot hang the release."""
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception as exc:
+            print(f"  (stream close failed: {exc!r})", flush=True)
+
     def _on_audio(self, data, frames, time_info, status) -> None:
         self.level = float(np.sqrt(np.mean(np.square(data))))
         self.q.put(bytes(data))
@@ -464,13 +472,14 @@ class Recorder:
         """Open whatever is *currently* the default input device.
 
         PortAudio caches the device list at Pa_Initialize and never re-reads it,
-        so a Bluetooth headset coming or going leaves us pointing at a device
-        that may no longer exist (-10851 Invalid Property Value) — or silently
-        stuck on the built-in mic after the headset is back. A full re-scan
-        costs ~3ms, so we do it every press: always the live default.
+        so a vanished default device fails with -10851. We therefore re-scan on
+        failure, and the idle heartbeat re-scans proactively (on a worker thread)
+        so a *reconnected* headset is picked up.
+
+        Deliberately NOT done per press: tearing PortAudio down while the audio
+        device set is changing can block inside CoreAudio on a HAL mutex
+        (observed in HAL_HardwarePlugIn_DeviceStop), which froze the press.
         """
-        sd._terminate()
-        sd._initialize()
         for attempt in (1, 2):
             try:
                 if self.device is None:
@@ -565,8 +574,16 @@ class Recorder:
         self.t_release = time.perf_counter()
         try:
             time.sleep(tail_ms / 1000)  # catch the last syllable before the mic closes
-            self.stream.stop()
-            self.stream.close()
+            # PortAudio's stop/close can block inside CoreAudio while the device
+            # is being changed underneath us (seen waiting on a HAL mutex in
+            # HAL_HardwarePlugIn_DeviceStop). Bound it: a wedged teardown must
+            # never leave the pill on screen or swallow the transcription.
+            self.stop.set()
+            closer = threading.Thread(target=self._close_stream, daemon=True)
+            closer.start()
+            closer.join(timeout=2.0)
+            if closer.is_alive():
+                print("! audio teardown wedged (device changing?) — carrying on", flush=True)
             t_capture = time.perf_counter()  # audio fully captured from here
             self.stop.set()
             self.thread.join()
@@ -860,7 +877,9 @@ def main() -> None:
     Quartz.CGEventTapEnable(tap, True)
 
     def heartbeat() -> None:
-        """Keep the tap armed, and never leave a press stuck forever."""
+        """Keep the tap armed, never leave a press stuck, and keep the audio
+        device list fresh while idle."""
+        ticks["n"] += 1
         if not Quartz.CGEventTapIsEnabled(tap):
             Quartz.CGEventTapEnable(tap, True)
             if tap_warn.tick():
@@ -875,6 +894,27 @@ def main() -> None:
             # Last-resort valve. A release lost with no disable notification has
             # no other signal, and a stuck press means a dead hotkey.
             end_press("press exceeded 5 minutes")
+        elif ticks["n"] % 60 == 0 and not (recorder.active or recorder.busy):
+            # Every ~30s while idle: re-read the device list so a reconnected
+            # headset becomes the default again. Off the main thread, and never
+            # during a press — see _open_stream for why that matters.
+            threading.Thread(target=refresh_devices, daemon=True).start()
+
+    refreshing = {"busy": False}
+
+    def refresh_devices() -> None:
+        if refreshing["busy"]:
+            return
+        refreshing["busy"] = True
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception as exc:
+            print(f"  (device refresh failed: {exc!r})", flush=True)
+        finally:
+            refreshing["busy"] = False
+
+    ticks = {"n": 0}
 
     AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.5, KeepAlive.alloc().initWithCheck_(heartbeat), "noop:", None, True
