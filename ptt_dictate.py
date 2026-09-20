@@ -507,7 +507,8 @@ class Recorder:
         """One tiny forward pass, purely so the pages are resident by release."""
         try:
             t0 = time.perf_counter()
-            self.model.generate(self._silence())
+            with self.model_lock:
+                self.model.generate(self._silence())
             took = time.perf_counter() - t0
             if took > 0.25:  # only worth reporting when it actually paged in
                 print(f"  (prewarm {took:.1f}s — model had been evicted)", flush=True)
@@ -601,7 +602,8 @@ class Session:
             # quiet speaker ends up with "stopped working".
             print(f"  (very quiet: peak {peak:.4f} — mic muted?)", flush=True)
         t0 = time.perf_counter()
-        out = rec.model.generate(self.buf, **rec._bias_kwargs())
+        with rec.model_lock:
+            out = rec.model.generate(self.buf, **rec._bias_kwargs())
         self.transcribe_s += time.perf_counter() - t0
         rec.t_last_transcribe = time.perf_counter()
         piece = clean(result_text(out))
@@ -620,7 +622,8 @@ class Session:
             window = np.pad(window, (0, rec.WIN - window.size))  # pad the tail, not the head
         features = rec.model.encode_speech(mx.array(window)[None, :])
         t0 = time.perf_counter()
-        text, self.state = rec.model.streaming_generate_step(features, self.state)
+        with self.rec.model_lock:
+            text, self.state = self.rec.model.streaming_generate_step(features, self.state)
         self.transcribe_s += time.perf_counter() - t0
         self.steps += 1
         piece = clean(text)
