@@ -398,6 +398,12 @@ class Recorder:
     def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6, batch: bool = False, min_rms: float = 0.002, context_file: str = "", prewarm: bool = True):
         self.model = model
         self.t_last_transcribe = 0.0  # gates the prewarm; never reset per press
+        # One lock for every model call. Sessions overlap by design (a new press
+        # starts capturing while an older one still transcribes) and the prewarm
+        # runs concurrently too, so this keeps MLX to one call at a time —
+        # determinism over throughput: a corrupted paste is the failure mode, and
+        # capture latency is unaffected because only the transcribe queues.
+        self.model_lock = threading.Lock()
         self.context = context
         self.context_file = context_file
         self.prewarm = prewarm
