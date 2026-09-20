@@ -190,6 +190,11 @@ logs to `~/Library/Logs/ptt-dictate/daemon.log`. The model stays resident
 (~3GB). Nothing machine-specific is committed — `launchctl bootstrap` cannot
 expand `~`, so the paths are written at install time.
 
+The log holds your dictated text in cleartext, so it **size-rotates itself**
+(5MB, keeping 3) from the daemon's own heartbeat: launchd owns the file
+handle, so rotating means renaming and then `dup2`-ing a fresh file over
+stdout/stderr. `--log-max-mb 0` disables it.
+
 ```bash
 ./install.sh --key right_option --context "Kubernetes, Postgres"
 ./uninstall.sh                                                   # stop + remove

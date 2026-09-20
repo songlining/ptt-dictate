@@ -73,6 +73,36 @@ def meter_level(rms: float) -> float:
     return min(1.0, max(0.0, rms) ** 0.5 * 3.2)
 
 
+def rotate_log(path: str, max_bytes: int, keep: int = 3) -> None:
+    """Size-rotate our own log, in place.
+
+    launchd hands us the log on fd 1/2, so renaming alone would leave the daemon
+    writing into the *rotated* file and the new one would stay empty forever.
+    After shifting the older files, reopen the path and dup2 it over stdout/stderr
+    so subsequent writes land in the fresh file.
+    """
+    if not path or max_bytes <= 0:
+        return
+    try:
+        if os.path.getsize(path) < max_bytes:
+            return
+    except OSError:
+        return  # not there (yet), or not ours
+    try:
+        for i in range(keep - 1, 0, -1):
+            older, newer = f"{path}.{i}", f"{path}.{i + 1}"
+            if os.path.exists(older):
+                os.replace(older, newer)
+        os.replace(path, f"{path}.1")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(fd, 1)  # stdout
+        os.dup2(fd, 2)  # stderr, incl. PortAudio's C-level messages
+        os.close(fd)
+        print(f"(rotated log at {max_bytes / 1048576:.1f}MB; keeping {keep})", flush=True)
+    except OSError as exc:
+        print(f"! log rotation failed: {exc!r}", flush=True)
+
+
 def _dedupe(words: list[str]) -> list[str]:
     """Case-insensitive dedupe, order preserved."""
     seen, out = set(), []
@@ -799,6 +829,8 @@ def main() -> None:
     ap.add_argument("--overlay-text", default="直接说", help="pill text while waiting for speech")
     ap.add_argument("--no-prewarm", action="store_true",
                     help="skip the on-press warm-up that hides a compressed model's page-in")
+    ap.add_argument("--log-file", default="", help="rotate this file when it grows (install.sh sets it)")
+    ap.add_argument("--log-max-mb", type=int, default=5, help="rotate above this size; 0 disables")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
@@ -971,6 +1003,8 @@ def main() -> None:
             # headset becomes the default again. Off the main thread, and never
             # during a press — see _open_stream for why that matters.
             threading.Thread(target=refresh_devices, daemon=True).start()
+        if ticks["n"] % 120 == 0:  # ~1min
+            rotate_log(args.log_file, args.log_max_mb << 20)
 
     refreshing = {"busy": False}
 

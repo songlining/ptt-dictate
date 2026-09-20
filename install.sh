@@ -57,7 +57,7 @@ mkdir -p "$(dirname "$LOG")"
   echo '  <key>ProgramArguments</key><array>'
   echo "    <string>$PYTHON</string>"
   echo "    <string>$REPO/ptt_dictate.py</string>"
-  for arg in "$@" --context-file "$HOTWORDS"; do
+  for arg in "$@" --context-file "$HOTWORDS" --log-file "$LOG"; do
     echo "    <string>$arg</string>"
   done
   echo '  </array>'
