@@ -385,7 +385,15 @@ def paste_restore(previous, delay: float) -> None:
 
 
 class Recorder:
-    """One press-to-release dictation cycle against a loaded ASR model."""
+    """Config, the model, and the press/release lifecycle.
+
+    All per-press state lives on `Session` — one press→release cycle. This
+    object only points at the session that is recording (`current`) and
+    remembers the ones still finishing (`inflight`), so a new press can start
+    capturing while an older session is still transcribing and pasting. (When
+    this state sat here, the release held the gate for its whole ~0.6-1.0s and
+    a press arriving inside that window was silently dropped.)
+    """
 
     def __init__(self, model, context: str = "", live_file: str = "", dry_run: bool = False, device=None, overlay=None, paste_delay: float = 0.6, batch: bool = False, min_rms: float = 0.002, context_file: str = "", prewarm: bool = True):
         self.model = model
@@ -408,43 +416,69 @@ class Recorder:
         self.WIN = 0 if batch else model.streaming_window_samples
         self.ADV = 0 if batch else model.streaming_chunk_samples
         self.lock = threading.Lock()
-        self.active = False
-        self.busy = False
-        self.reset()
+        self.gen = 0
+        self.current: Session | None = None  # the session that is recording
+        self.inflight: set[Session] = set()  # recording, or finishing in a thread
 
-    def reset(self) -> None:
-        self.buf = np.zeros(0, dtype=np.float32)
-        self.steps = 0
-        self.parts: list[str] = []
-        self.text_so_far = ""
-        self.level = 0.0
-        self.transcribe_s = 0.0  # model time, accumulated by the worker thread
-        self.t_release = 0.0
-        self.t_press = 0.0
-        self.state = None
-        self.stream = None  # a previous press's stream is gone; never close it again
-        self.stop = threading.Event()
+    # Read by the event-tap callback, the heartbeat and the overlay tick; they
+    # describe whichever session is recording (0/"" when none is).
+    @property
+    def active(self) -> bool:
+        return self.current is not None
 
-    def feed(self, chunk: np.ndarray) -> None:
-        """Buffer new audio; step once per full window, sliding by the advance.
+    @property
+    def busy(self) -> bool:
+        return bool(self.inflight)
 
-        Mirrors the model's own chunk iterator: window k covers
-        [k*ADV, k*ADV+WIN), so the lookahead tail of one window is the head of
-        the next. Feeding a wider overlap makes the model re-transcribe it.
-        """
-        self.buf = np.concatenate([self.buf, chunk])
-        if self.batch:
-            return  # one pass over the whole press, at release
-        while self.buf.size >= self.WIN:
-            self._step()
-            self.buf = self.buf[self.ADV :]
+    @property
+    def t_press(self) -> float:
+        cur = self.current
+        return cur.t_press if cur is not None else 0.0
 
-    def flush(self) -> None:
-        """Streaming: final padded step on the tail. Batch: transcribe it all."""
-        if self.batch:
-            self._transcribe()
-        elif self.buf.size >= self.SR // 10:
-            self._step()
+    @property
+    def level(self) -> float:
+        cur = self.current
+        return cur.level if cur is not None else 0.0
+
+    @property
+    def text_so_far(self) -> str:
+        cur = self.current
+        return cur.text_so_far if cur is not None else ""
+
+    def press(self) -> None:
+        with self.lock:
+            if self.current is not None:
+                return  # duplicate key-down while a press is already recording
+            self.gen += 1
+            session = Session(self, self.gen)
+            self.current = session
+            self.inflight.add(session)
+        if self.overlay is not None:
+            self.overlay.show_pill()
+        # Fault the weights back into RAM while the user is still speaking.
+        # After a long idle spell macOS compresses the model (~2.4GB: resident
+        # has been measured at 0.10GB), and the release-time transcribe would
+        # otherwise pay seconds of page-in before producing anything. This runs
+        # concurrently with the user talking, so the only visible cost is a
+        # short GPU burst that no one is waiting on.
+        # Only worth it after an idle spell. If we transcribed recently the pages
+        # are resident anyway, and an unnecessary generate() would compete with the
+        # real one for the GPU — which can *add* latency to a short press.
+        if self.prewarm and time.perf_counter() - self.t_last_transcribe > 60:
+            threading.Thread(target=self._prewarm, daemon=True).start()
+        session.start()  # spawns threads only — this is the event-tap callback
+        print("● listening", flush=True)
+
+    def release(self, tail_ms: int = 200) -> None:
+        # Take `current` synchronously, so two releases in quick succession (a
+        # real one plus, say, a tap-disable ending the press) can only ever
+        # start one finish; the second finds None and does nothing.
+        with self.lock:
+            session = self.current
+            self.current = None
+        if session is None:
+            return
+        threading.Thread(target=session.finish, args=(tail_ms,), daemon=True).start()
 
     def _hotwords(self) -> list[str]:
         """--context plus the standing list in --context-file.
@@ -469,35 +503,124 @@ class Recorder:
             return {"hotwords": words}
         return {}
 
+    def _prewarm(self) -> None:
+        """One tiny forward pass, purely so the pages are resident by release."""
+        try:
+            t0 = time.perf_counter()
+            self.model.generate(self._silence())
+            took = time.perf_counter() - t0
+            if took > 0.25:  # only worth reporting when it actually paged in
+                print(f"  (prewarm {took:.1f}s — model had been evicted)", flush=True)
+        except Exception as exc:  # never let a warm-up break a dictation
+            print(f"  (prewarm failed: {exc!r})", flush=True)
+
+    def _silence(self) -> np.ndarray:
+        """1s of silence to warm on (models pad short inputs internally)."""
+        if not hasattr(self, "_silence_buf"):
+            self._silence_buf = np.zeros(self.SR, dtype=np.float32)
+        return self._silence_buf
+
+
+class Session:
+    """One press→release cycle: capture, teardown, transcribe, paste.
+
+    Everything that used to sit on the Recorder and serialise presses lives
+    here now — the audio buffer and queue, the mic stream, the streaming
+    state, the partials, the timings — so a session runs to completion on its
+    own thread while the next press is already recording. Created under the
+    recorder lock by `press()`; ends by dropping out of `recorder.inflight`.
+    """
+
+    def __init__(self, rec: Recorder, gen: int):
+        self.rec = rec
+        self.gen = gen
+        self.buf = np.zeros(0, dtype=np.float32)
+        self.steps = 0
+        self.parts: list[str] = []
+        self.text_so_far = ""
+        self.level = 0.0
+        self.transcribe_s = 0.0  # model time, accumulated by the worker thread
+        self.t_release = 0.0
+        self.t_press = time.perf_counter()
+        self.state = None
+        self.stream = None  # a previous press's stream is gone; never close it again
+        self.stop = threading.Event()
+        self.q: queue.Queue = queue.Queue()
+        self._opened = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Spawn the capture threads. Threads only — press() runs on the
+        event-tap callback and must never block."""
+        # Batch models have no streaming state to prefill (nor init_streaming_state).
+        if not self.rec.batch:
+            self.state = (
+                self.rec.model.init_streaming_state(context_info=self.rec.context)
+                if self.rec.context
+                else self.rec.model.init_streaming_state()
+            )
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        # The mic OPEN must not run here. This is the event-tap callback, i.e. the
+        # main thread, and PortAudio's open can block on a CoreAudio HAL mutex
+        # (observed: Pa_OpenStream -> HALB_Mutex::Lock). Blocking the main thread
+        # froze the pill, the timers and every later keypress — the daemon went
+        # deaf with no log line. Open on a worker, and bound it.
+        threading.Thread(target=self._open_bounded, daemon=True).start()
+        threading.Thread(target=self._open_watchdog, daemon=True).start()
+
+    def feed(self, chunk: np.ndarray) -> None:
+        """Buffer new audio; step once per full window, sliding by the advance.
+
+        Mirrors the model's own chunk iterator: window k covers
+        [k*ADV, k*ADV+WIN), so the lookahead tail of one window is the head of
+        the next. Feeding a wider overlap makes the model re-transcribe it.
+        """
+        self.buf = np.concatenate([self.buf, chunk])
+        if self.rec.batch:
+            return  # one pass over the whole press, at release
+        while self.buf.size >= self.rec.WIN:
+            self._step()
+            self.buf = self.buf[self.rec.ADV :]
+
+    def flush(self) -> None:
+        """Streaming: final padded step on the tail. Batch: transcribe it all."""
+        if self.rec.batch:
+            self._transcribe()
+        elif self.buf.size >= self.rec.SR // 10:
+            self._step()
+
     def _transcribe(self) -> None:
-        if too_short(self.buf, self.SR):
-            print(f"  (skipped: only {self.buf.size / self.SR:.2f}s of audio)", flush=True)
+        rec = self.rec
+        if too_short(self.buf, rec.SR):
+            print(f"  (skipped: only {self.buf.size / rec.SR:.2f}s of audio)", flush=True)
             return
-        peak = peak_level(self.buf, self.SR)
-        if peak < self.min_rms:
+        peak = peak_level(self.buf, rec.SR)
+        if peak < rec.min_rms:
             # Informational only — we still transcribe. Blocking here is how a
             # quiet speaker ends up with "stopped working".
             print(f"  (very quiet: peak {peak:.4f} — mic muted?)", flush=True)
         t0 = time.perf_counter()
-        out = self.model.generate(self.buf, **self._bias_kwargs())
+        out = rec.model.generate(self.buf, **rec._bias_kwargs())
         self.transcribe_s += time.perf_counter() - t0
-        self.t_last_transcribe = time.perf_counter()
+        rec.t_last_transcribe = time.perf_counter()
         piece = clean(result_text(out))
         if piece:
             self.parts.append(piece)
             self.text_so_far = piece
             print(f"  {piece}", flush=True)
-            if self.live_file:
-                with open(self.live_file, "a") as fh:
+            if rec.live_file:
+                with open(rec.live_file, "a") as fh:
                     fh.write(piece + "\n")
 
     def _step(self) -> None:
-        window = self.buf[: self.WIN]
-        if window.size < self.WIN:
-            window = np.pad(window, (0, self.WIN - window.size))  # pad the tail, not the head
-        features = self.model.encode_speech(mx.array(window)[None, :])
+        rec = self.rec
+        window = self.buf[: rec.WIN]
+        if window.size < rec.WIN:
+            window = np.pad(window, (0, rec.WIN - window.size))  # pad the tail, not the head
+        features = rec.model.encode_speech(mx.array(window)[None, :])
         t0 = time.perf_counter()
-        text, self.state = self.model.streaming_generate_step(features, self.state)
+        text, self.state = rec.model.streaming_generate_step(features, self.state)
         self.transcribe_s += time.perf_counter() - t0
         self.steps += 1
         piece = clean(text)
@@ -505,18 +628,17 @@ class Recorder:
             self.parts.append(piece)
             self.text_so_far = " ".join(self.parts)
             print(f"  {piece}", flush=True)
-            if self.live_file:
-                with open(self.live_file, "a") as fh:
+            if rec.live_file:
+                with open(rec.live_file, "a") as fh:
                     fh.write(piece + "\n")
 
     def _close_stream(self) -> None:
         """Teardown, on its own thread so a HAL stall cannot hang the release."""
-        stream = getattr(self, "stream", None)
-        if stream is None:
+        if self.stream is None:
             return  # the open never completed
         try:
-            stream.stop()
-            stream.close()
+            self.stream.stop()
+            self.stream.close()
             self.stream = None
         except Exception as exc:
             print(f"  (stream close failed: {exc!r})", flush=True)
@@ -537,19 +659,20 @@ class Recorder:
         device set is changing can block inside CoreAudio on a HAL mutex
         (observed in HAL_HardwarePlugIn_DeviceStop), which froze the press.
         """
+        rec = self.rec
         for attempt in (1, 2):
             try:
-                if self.device is None:
+                if rec.device is None:
                     dev = sd.query_devices(sd.default.device[0])
-                    if dev["name"] != self.last_device:
+                    if dev["name"] != rec.last_device:
                         print(
                             f"mic: {dev['name']} (native {dev['default_samplerate']:.0f}Hz)",
                             flush=True,
                         )
-                        self.last_device = dev["name"]
+                        rec.last_device = dev["name"]
                 self.stream = sd.InputStream(
-                    device=self.device,
-                    samplerate=self.SR,
+                    device=rec.device,
+                    samplerate=rec.SR,
                     channels=1,
                     dtype="float32",
                     callback=self._on_audio,
@@ -573,48 +696,6 @@ class Recorder:
                 sd._terminate()
                 sd._initialize()
 
-    def press(self) -> None:
-        with self.lock:
-            if self.active or self.busy:
-                return
-            self.active = True
-        self.reset()
-        self.t_press = time.perf_counter()
-        # Batch models have no streaming state to prefill (nor init_streaming_state).
-        if self.batch:
-            self.state = None
-        else:
-            self.state = (
-                self.model.init_streaming_state(context_info=self.context)
-                if self.context
-                else self.model.init_streaming_state()
-            )
-        self.q: queue.Queue = queue.Queue()
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-        if self.overlay is not None:
-            self.overlay.show_pill()
-        # Fault the weights back into RAM while the user is still speaking.
-        # After a long idle spell macOS compresses the model (~2.4GB: resident
-        # has been measured at 0.10GB), and the release-time transcribe would
-        # otherwise pay seconds of page-in before producing anything. This runs
-        # concurrently with the user talking, so the only visible cost is a
-        # short GPU burst that no one is waiting on.
-        # Only worth it after an idle spell. If we transcribed recently the pages
-        # are resident anyway, and an unnecessary generate() would compete with the
-        # real one for the GPU — which can *add* latency to a short press.
-        if self.prewarm and time.perf_counter() - self.t_last_transcribe > 60:
-            threading.Thread(target=self._prewarm, daemon=True).start()
-        # The mic OPEN must not run here. This is the event-tap callback, i.e. the
-        # main thread, and PortAudio's open can block on a CoreAudio HAL mutex
-        # (observed: Pa_OpenStream -> HALB_Mutex::Lock). Blocking the main thread
-        # froze the pill, the timers and every later keypress — the daemon went
-        # deaf with no log line. Open on a worker, and bound it.
-        self._opened = threading.Event()
-        threading.Thread(target=self._open_bounded, daemon=True).start()
-        threading.Thread(target=self._open_watchdog, daemon=True).start()
-        print("● listening", flush=True)
-
     def _open_bounded(self) -> None:
         """Open the mic on a worker thread; failure aborts the capture, nothing more."""
         try:
@@ -636,86 +717,6 @@ class Recorder:
         time.sleep(0.2)  # let the line above reach the log
         os._exit(0)  # launchd KeepAlive brings us back with fresh audio
 
-    def _prewarm(self) -> None:
-        """One tiny forward pass, purely so the pages are resident by release."""
-        try:
-            t0 = time.perf_counter()
-            self.model.generate(self._silence())
-            took = time.perf_counter() - t0
-            if took > 0.25:  # only worth reporting when it actually paged in
-                print(f"  (prewarm {took:.1f}s — model had been evicted)", flush=True)
-        except Exception as exc:  # never let a warm-up break a dictation
-            print(f"  (prewarm failed: {exc!r})", flush=True)
-
-    def _silence(self) -> np.ndarray:
-        """1s of silence to warm on (models pad short inputs internally)."""
-        if not hasattr(self, "_silence_buf"):
-            self._silence_buf = np.zeros(self.SR, dtype=np.float32)
-        return self._silence_buf
-
-    def release(self, tail_ms: int = 200) -> None:
-        with self.lock:
-            if not self.active:
-                return
-            self.active = False
-            self.busy = True
-        self.t_release = time.perf_counter()
-        wedged = False
-        try:
-            time.sleep(tail_ms / 1000)  # catch the last syllable before the mic closes
-            if getattr(self, "_opened", None) is not None:
-                self._opened.wait(timeout=1.0)  # a press can end before the open did
-            # PortAudio's stop/close can block inside CoreAudio while the device
-            # is being changed underneath us (seen waiting on a HAL mutex in
-            # HAL_HardwarePlugIn_DeviceStop). Bound it, and set `stop` only once
-            # the mic is closed, so the worker's transcribe cannot overlap capture
-            # — overlapping is why the latency line below used to not add up.
-            closer = threading.Thread(target=self._close_stream, daemon=True)
-            closer.start()
-            closer.join(timeout=2.0)
-            wedged = closer.is_alive()
-            if wedged:
-                print("! audio teardown wedged — audio subsystem is poisoned", flush=True)
-            self.stop.set()
-            t_capture = time.perf_counter()  # audio fully captured from here
-            self.thread.join()
-            text = clean(" ".join(self.parts))
-            if not text:
-                print("→ (nothing)", flush=True)
-            else:
-                print(f"→ {text}", flush=True)
-                t0 = time.perf_counter()
-                previous = None if self.dry_run else paste_start(text)
-                t1 = time.perf_counter()
-                # Free the hotkey the instant the paste has been posted. Holding it
-                # through the clipboard-restore delay (~0.6s) turned every
-                # back-to-back dictation into a silent no-op: no pill, no log.
-                with self.lock:
-                    self.busy = False
-                print(
-                    f"  [release→paste {t1 - self.t_release:.2f}s"
-                    f" = capture {t_capture - self.t_release:.2f}s"
-                    f" + transcribe {self.transcribe_s:.2f}s"
-                    f" + paste {t1 - t0:.2f}s]",
-                    flush=True,
-                )
-                paste_restore(previous, self.paste_delay)
-        except Exception as exc:  # keep the daemon alive through a bad cycle
-            print(f"release failed: {exc!r}", flush=True)
-        finally:
-            if self.overlay is not None:
-                self.overlay.hide_pill()
-            with self.lock:
-                self.busy = False
-            if wedged:
-                # PortAudio is stuck holding a CoreAudio HAL mutex; the next open
-                # would block on it forever — that is how the daemon went deaf.
-                # The text is already pasted, so hand over to launchd for a clean
-                # audio subsystem instead of limping on.
-                print("  (restarting for a clean audio subsystem)", flush=True)
-                time.sleep(0.3)
-                os._exit(0)
-
     def _run(self) -> None:
         while not self.stop.is_set():
             try:
@@ -731,6 +732,63 @@ class Recorder:
             self.feed(np.frombuffer(block, dtype=np.float32))
         if self.buf.size or self.steps == 0:
             self.flush()
+
+    def finish(self, tail_ms: int) -> None:
+        """Release side of the cycle, on its own thread: tail sleep, bounded
+        close, transcribe, paste. Runs while a newer session may already be
+        recording — nothing here touches `recorder.current`."""
+        rec = self.rec
+        self.t_release = time.perf_counter()
+        wedged = False
+        try:
+            time.sleep(tail_ms / 1000)  # catch the last syllable before the mic closes
+            self._opened.wait(timeout=1.0)  # a press can end before the open did
+            # PortAudio's stop/close can block inside CoreAudio while the device
+            # is being changed underneath us (seen waiting on a HAL mutex in
+            # HAL_HardwarePlugIn_DeviceStop). Bound it, and set `stop` only once
+            # the mic is closed, so the worker's transcribe cannot overlap capture
+            # — overlapping is why the latency line below used to not add up.
+            closer = threading.Thread(target=self._close_stream, daemon=True)
+            closer.start()
+            closer.join(timeout=2.0)
+            wedged = closer.is_alive()
+            if wedged:
+                print("! audio teardown wedged — audio subsystem is poisoned", flush=True)
+            self.stop.set()
+            t_capture = time.perf_counter()  # audio fully captured from here
+            if self.thread is not None:
+                self.thread.join()
+            text = clean(" ".join(self.parts))
+            if not text:
+                print("→ (nothing)", flush=True)
+            else:
+                print(f"→ {text}", flush=True)
+                t0 = time.perf_counter()
+                previous = None if rec.dry_run else paste_start(text)
+                t1 = time.perf_counter()
+                print(
+                    f"  [release→paste {t1 - self.t_release:.2f}s"
+                    f" = capture {t_capture - self.t_release:.2f}s"
+                    f" + transcribe {self.transcribe_s:.2f}s"
+                    f" + paste {t1 - t0:.2f}s]",
+                    flush=True,
+                )
+                paste_restore(previous, rec.paste_delay)
+        except Exception as exc:  # keep the daemon alive through a bad cycle
+            print(f"release failed: {exc!r}", flush=True)
+        finally:
+            with rec.lock:
+                rec.inflight.discard(self)
+            if rec.overlay is not None and rec.current is None:
+                rec.overlay.hide_pill()  # a newer press may be showing its own pill
+            if wedged:
+                # PortAudio is stuck holding a CoreAudio HAL mutex; the next open
+                # would block on it forever — that is how the daemon went deaf.
+                # The text is already pasted, so hand over to launchd for a clean
+                # audio subsystem instead of limping on.
+                print("  (restarting for a clean audio subsystem)", flush=True)
+                time.sleep(0.3)
+                os._exit(0)
 
 
 class _FakeModel:
@@ -779,26 +837,28 @@ def self_test() -> None:
     assert meter_level(0.5) == 1.0  # clamped, never overflows the bar
 
     rec = Recorder(_FakeModel(), dry_run=True)
-    rec.reset()
-    rec.state = rec.model.init_streaming_state()
-    rec.feed(np.ones(3, dtype=np.float32))  # first step: full window
-    assert rec.steps == 1, rec.steps
-    rec.feed(np.ones(1, dtype=np.float32))  # below ADV -> no step
-    assert rec.steps == 1, rec.steps
-    rec.feed(np.ones(1, dtype=np.float32))  # ADV reached -> step
-    assert rec.steps == 2, rec.steps
-    rec.feed(np.ones(1, dtype=np.float32))  # tail, flushed on release
-    assert rec.steps == 2, rec.steps
-    rec.flush()
-    assert rec.steps == 3, rec.steps
-    assert rec.parts == ["chunk1", "chunk2", "chunk3"], rec.parts
+    assert rec.SR == 10 and rec.WIN == 3 and rec.ADV == 2
+    assert rec.active is False and rec.busy is False  # no session yet
+    sess = Session(rec, 1)
+    sess.state = rec.model.init_streaming_state()  # what Session.start() does first
+    sess.feed(np.ones(3, dtype=np.float32))  # first step: full window
+    assert sess.steps == 1, sess.steps
+    sess.feed(np.ones(1, dtype=np.float32))  # below ADV -> no step
+    assert sess.steps == 1, sess.steps
+    sess.feed(np.ones(1, dtype=np.float32))  # ADV reached -> step
+    assert sess.steps == 2, sess.steps
+    sess.feed(np.ones(1, dtype=np.float32))  # tail, flushed on release
+    assert sess.steps == 2, sess.steps
+    sess.flush()
+    assert sess.steps == 3, sess.steps
+    assert sess.parts == ["chunk1", "chunk2", "chunk3"], sess.parts
     # window bookkeeping: window k = [k*ADV, k*ADV+WIN) — no wider overlap
-    rec.reset()
-    rec.state = rec.model.init_streaming_state()
-    rec.buf = np.arange(7, dtype=np.float32)
+    sess2 = Session(rec, 2)
+    sess2.state = rec.model.init_streaming_state()
+    sess2.buf = np.arange(7, dtype=np.float32)
     seen = []
-    rec._step = lambda: seen.append(rec.buf[: rec.WIN].copy())
-    rec.feed(np.zeros(0, dtype=np.float32))
+    sess2._step = lambda: seen.append(sess2.buf[: rec.WIN].copy())
+    sess2.feed(np.zeros(0, dtype=np.float32))
     assert [w.tolist() for w in seen] == [[0, 1, 2], [2, 3, 4], [4, 5, 6]], seen
     print("self-test OK")
 
