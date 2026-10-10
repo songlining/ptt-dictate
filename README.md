@@ -208,8 +208,9 @@ Editing the script requires a bootout + bootstrap to take effect. Because
 
 ## Troubleshooting
 
-Every failure mode here is *silent* — the daemon looks healthy and no text
-appears. Start with the log, `~/Library/Logs/ptt-dictate/daemon.log`: you want
+Almost every failure mode here is *silent* — the daemon looks healthy and no
+text appears; the exception is the clipped head below, where text does arrive.
+Start with the log, `~/Library/Logs/ptt-dictate/daemon.log`: you want
 `● listening` on press and `→ <text>` on release. Anything else is the clue.
 
 **It worked, then stopped.** macOS disabled the event tap (callback timeout, or
@@ -224,6 +225,60 @@ returns nothing for room tone rather than inventing words — so silence points 
 the microphone, not the model. Bluetooth headsets come and go: a failed open
 re-scans the device list, and an idle loop re-scans every ~30s so a reconnected
 headset becomes the default again. The log prints `mic: <name>` when it changes.
+
+**The first word or two goes missing.** Nothing in the pipeline trims the head:
+in batch mode the whole press is a single `generate()` over a buffer that begins
+at the first audio callback, streaming windows keep `[0, WIN)`, and Qwen3-ASR
+only splits audio longer than 20 minutes (and only pads the tail). So the words
+are not dropped downstream — they were never captured, which puts the loss in
+the window between the key-down and the first callback. That window is
+overwhelmingly the device's, not the code's: measured on a Bose QC Ultra 2 HP
+already in HFP, the open returns in ~20ms and the first callback lands ~19ms
+later (18–24ms, still so after 120s idle), far too little for a word (~300ms).
+A Bluetooth headset sitting in A2DP — something playing through it — instead
+has to switch to HFP/SCO when the input stream opens, on the order of hundreds
+of ms during which the mic does not appear to be carrying audio; that switch was
+never timed here, which is the part still open. Unconfirmed as the root cause of
+the episodes that were actually reported: the symptom faded with no code change,
+which is also what a link that is now parked in HFP looks like — so expect it
+back when audio plays through the headset again.
+
+Confirm cheaply with `--device "MacBook Pro Microphone"` (the name, not an
+index — indices move as devices connect and disconnect): if the loss stops
+there, it is the headset's profile switch, not the daemon. To time the window
+directly, open the mic the way a press does:
+
+```python
+import time, sounddevice as sd
+# add device="MacBook Pro Microphone" to time the mic your --device actually uses
+t0, first = time.perf_counter(), {}
+s = sd.InputStream(samplerate=16000, channels=1, dtype="float32",
+                   callback=lambda *a: first.setdefault("t", time.perf_counter()))
+s.start(); time.sleep(1.0); s.stop(); s.close()
+print(f"first callback {1000 * (first['t'] - t0):.0f} ms after the open began")
+```
+
+The log cannot see this class of loss: its `capture` figure is counted from the
+release (tail sleep + teardown), so the head is invisible to it by construction.
+
+**Nothing at all arrives: `(very quiet: peak 0.0000 — mic muted?)` then `(nothing)`.**
+Digital silence from the *device*, per the paragraph above: worth confirming
+outside the daemon before touching code — a 2s probe of that device returns
+`peak=0.00000` while the built-in mic returns room tone in 60ms. The reason is
+in `log show --last 12h --predicate 'process == "bluetoothd"'` (widen `--last`,
+or use `--start/--end`, to reach the incident): on 2026-10-02 it shows 112,424
+lines of `SCO connection handle is no longer valid. Dropping SCO data.` (≈270/s)
+in a burst from 14:23:15 to 14:30:18, and 140,324 in a comparable burst on
+2026-09-30. The headset's HFP voice channel (SCO) has a stale HCI handle while
+macOS still enumerates `Bose QC Ultra 2 HP` as an input, so CoreAudio hands out
+zeros. What the log shows *around* the break: HFP LinkQualityReport stays
+healthy (RSSI ≈ -40, `eSCO scheduled pkts` ≈ 133/s, zero retransmits) right up to
+the press, and the drops begin with the first press and stop when the stream
+closes — so there is no disconnect event to detect, only silence once audio has
+to flow. Whether an idle gap clears the stale handle is untested. Power-cycle
+the headset (or toggle Bluetooth) to rebuild the link — or dictate on a wired or
+built-in mic (`--device "MacBook Pro Microphone"` on this machine), which also
+skips the per-press SCO setup described above.
 
 **It never reacts to the key.** Accessibility hasn't been granted to the
 interpreter — see Requirements.
