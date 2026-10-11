@@ -87,7 +87,16 @@ vanishes, which is exactly what the default NSPanel behaviour does here.
 ~/models/venv-mlx-audio/bin/python ./ptt_dictate.py --key right_option
 ```
 
-Then hold the key, speak, release.
+Then hold the key, speak, release. **Double-press** it instead and recording runs
+hands-free: the mic stays open, the pill counts up (`● REC 0:42`), and a single
+press stops and transcribes. The first tap of a double-press is not thrown away —
+it is the start of the dictation — and a *single* short tap still transcribes as
+it always did, half a second later, because the daemon waits out the double-tap
+window before deciding. `--no-double-tap` removes that wait. Note that with
+`--key-passthrough` the foreground app sees *both* taps of the gesture.
+
+Hands-free sessions stop themselves at 20 minutes (hold-to-talk at 5), and either
+way what was captured is transcribed rather than discarded.
 
 | flag | default | notes |
 |------|---------|-------|
@@ -102,11 +111,15 @@ Then hold the key, speak, release.
 | `--live-file` | `""` | append live partials to a file |
 | `--tail-ms` | `200` | extra mic time after release, to catch the last syllable |
 | `--device` | system default | input device index or name |
+| `--no-double-tap` | off | no hands-free gesture: a press shorter than the window is transcribed at once instead of waiting to see whether it is half of a double-press |
+| `--double-tap-ms` | system | double-press window in ms; default is the system double-click interval, clamped to 300–700 |
+| `--polish-cmd` | `""` | rewrite the transcript through this command (stdin → stdout) — see below |
+| `--polish-timeout` | `6.0` | seconds before the rewriter is abandoned and the raw transcript pasted |
 | `--dry-run` | off | print the text instead of pasting it |
 | `--paste-delay` | `0.6` | seconds the transcript stays on the clipboard before the old one is restored |
 | `--no-overlay` | off | no status pill (headless / scripted use) |
 | `--overlay-text` | `直接说` | pill text while waiting for speech |
-| `--self-test` | — | window bookkeeping, text cleaning, meter curve — no model load |
+| `--self-test` | — | window bookkeeping, text cleaning, meter curve, the double-press gate, the rewrite guard — no model load |
 
 Run it attended first (`--dry-run`) to confirm the hotkey and the transcript
 before letting it paste into live apps.
@@ -147,6 +160,50 @@ with `PTT_HOTWORDS`).
 Keep the list to terms you actually dictate. A short, specific list is the point;
 nobody has measured what a long one does, and a list of everything you might ever
 say is unlikely to help.
+
+## Rephrasing the transcript
+
+`--polish-cmd` pipes the finished transcript through any command that reads text
+on stdin and writes text on stdout, and pastes what comes back:
+
+```bash
+ptt_dictate.py --polish-cmd \
+  'pi -p -nt --no-session --no-skills --no-extensions --no-context-files --no-mcp \
+   --thinking off --model deepseek/deepseek-flash'
+```
+
+It fixes punctuation, capitalisation, filler words (`um`, false starts, repeated
+words) and sentence/paragraph breaks, and repairs mis-hearings with the hotwords
+list as a spelling glossary. Measured on this machine: 1.3–2.2s added to a
+100–200 word dictation, with the pill reading `polishing…` in the meantime.
+Anything under 8 words — or under 24 characters, since CJK is dense — is pasted
+straight through; there is nothing to gain there.
+
+Three things make it safe to leave on:
+
+- **The transcript never reaches the command line.** It goes in on stdin, so it
+  is not visible in `ps`, and `--polish-cmd` is the single knob that decides
+  where it goes.
+- **A rewrite is only a candidate.** To be pasted it must still contain every
+  number and every hotword the transcript had, sit within 0.55–1.25× its length,
+  and not open with `Here is…`. Anything else — a dropped clause, a timeout, a
+  non-zero exit — is logged as `(polish skipped: <reason>)` and the raw
+  transcript is pasted instead. Every model tried got something wrong on real
+  dictation, so the guard is what makes this safe, not the choice of model.
+- **The rules travel with the code.** The prompt (rules + glossary) lives in
+  `ptt_dictate.py` and is sent on stdin ahead of the text, so swapping `--model`
+  cannot quietly drop the guardrails. A lower-case entry in `hotwords.txt`
+  cannot demote a name the transcript already capitalised: the text's casing
+  wins (`nomad` in the file, `Nomad` in the text, `Nomad` out).
+
+**A command that talks to a hosted model sends your dictation off the machine** —
+customer names, versions, architecture talk. That is why the default is off, and
+why a local rewriter (`ollama run …`, a local MLX model) needs no code at all:
+same interface, different `--polish-cmd`.
+
+Known limit: two dictations in quick succession paste in whichever order their
+*rewrites* finish — transcribes are serialised behind one lock, rewrites are not,
+and that is a wider window than it used to be.
 
 ## Runtime facts (measured on an M4 Pro, 8-bit MLX, 20s/10s clips)
 
