@@ -56,7 +56,8 @@ NOISE = re.compile(r"\[(?:silence|noise|music|applause|laughter|inaudible)\]", r
 SPEAKER = re.compile(r"\s*speaker\s*\d+\s*:\s*", re.I)
 METER_BARS = 5
 MIN_POLISH_WORDS = 8  # shorter than this a rewrite gains nothing and costs ~1.5s
-MIN_POLISH_CHARS = 24  # ...and CJK has no spaces, so words alone would skip it
+MIN_POLISH_CJK = 8  # Chinese has no spaces, and 8 characters is already a sentence
+CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 # A first line that is a *label* about the transcript rather than the dictation
 # (``Cleaned transcript: ...``). Only consulted for a line ending in a colon, so
 # a dictated "Note: ship it Friday" is left alone. English and Chinese, because
@@ -887,8 +888,9 @@ class Session:
         rec = self.rec
         if not rec.polish_cmd:
             return text, ""
-        if len(text.split()) < MIN_POLISH_WORDS and len(text) < MIN_POLISH_CHARS:
-            return text, ""  # 'yes please' cannot be improved, and CJK is dense
+        if len(text.split()) < MIN_POLISH_WORDS and len(CJK.findall(text)) < MIN_POLISH_CJK:
+            return text, ""  # 'yes please' cannot be improved; a short Chinese
+            # sentence can (that is why this counts characters, not spaces)
         with rec.lock:  # a count: two sessions can rewrite at once
             rec.polishing += 1
         t0 = time.perf_counter()
@@ -1079,6 +1081,10 @@ class Session:
                 text, note = self._polish(text)
                 if note:
                     print(f"  (polish skipped: {note})", flush=True)
+                elif self.polish_s and text == raw:
+                    # The rewriter ran and had nothing to fix. Say so: otherwise a
+                    # no-op rewrite is indistinguishable from not trying.
+                    print(f"  (polish: no changes in {self.polish_s:.2f}s)", flush=True)
                 print(f"→ {text}", flush=True)
                 t0 = time.perf_counter()
                 previous = None if rec.dry_run else paste_start(text)
@@ -1261,6 +1267,8 @@ def self_test() -> None:
     rec2 = Recorder(_FakeModel(), dry_run=True, prewarm=False, batch=True, polish_cmd="cat")
     sess3 = Session(rec2, 1)
     assert sess3._polish("yes please") == ("yes please", ""), "short text must not be rewritten"
+    assert sess3._polish("行，好的。") == ("行，好的。", ""), "5 characters is still too short"
+    assert sess3._polish("我，呃，我不知道我这个形容的对不对。")[1], "a Chinese sentence must not skip"
     long = "we set the ttl to sixty minutes and that is what we did in the demo"
     out, note = sess3._polish(long)
     assert out == long and note, (out, note)  # `cat` echoes the prompt: rejected
