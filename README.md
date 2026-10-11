@@ -173,10 +173,16 @@ ptt_dictate.py --polish-cmd \
    --thinking off --model deepseek/deepseek-flash'
 ```
 
-It fixes punctuation, capitalisation, filler words (`um`, false starts, repeated
-words) and sentence/paragraph breaks, and repairs mis-hearings with the hotwords
-list as a spelling glossary. Measured on this machine: 1.3–2.2s added to a
-100–200 word dictation, with the pill reading `polishing…` in the meantime.
+It repairs the *delivery*, not the content: punctuation, capitalisation,
+sentence and paragraph breaks, filler words (`um`, false starts), a repeated or
+restated phrase ("there is no manual issuing, not even manual issuing" is one
+statement), a self-correction ("a reframe, sorry, a rephrasing" → "a
+rephrasing"), and a garbled fragment ("hard to manage in the with its
+lifecycle" → "hard to manage with its lifecycle"). It also repairs mis-hearings
+with the hotwords list as a spelling glossary, and it will **not** swap a word
+for a synonym or translate — a Chinese sentence comes back in Chinese. Measured
+on this machine: 1.3–2.2s added to a 100–200 word dictation, with the pill
+reading `polishing…` in the meantime.
 Anything under 8 words **and** under 8 CJK characters is pasted straight through —
 Chinese has no spaces, so a short Chinese sentence counts as one "word", which is
 why the character count is there too. Nothing to gain from rewriting either.
@@ -193,11 +199,13 @@ Three things make it safe to leave on:
   is not visible in `ps`, and `--polish-cmd` is the single knob that decides
   where it goes.
 - **A rewrite is only a candidate.** It is pasted only if it still contains
-  every number and every hotword the transcript had, sits within 0.70–1.25× its
-  length, and does not open with `Here is…`. Under 40 words only the length is
-  checked: "the Terraform version, no wait, the Vault version" is 25 words in
-  and 13 out, so a retraction has to be allowed to delete what it retracted
-  (measured — that rewrite is correct, and the first version of this guard
+  every number and every hotword the transcript had, keeps the transcript's
+  language (a Chinese passage that comes back in English is rejected on the
+  script, not the words), sits within 0.70–1.25× its length, and does not open
+  with `Here is…`. Under 40 words only the length and the language are checked:
+  "the Terraform version, no wait, the Vault version" is 25 words in and 13 out,
+  so a retraction has to be allowed to delete what it retracted (measured — that
+  rewrite is correct, and the first version of this guard
   rejected it). Anything else — a dropped clause, a timeout, a non-zero exit —
   is logged as `(polish skipped: <reason>)` and the raw transcript is pasted
   instead. Every model tried got something wrong on real dictation, so the guard

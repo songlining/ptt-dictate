@@ -88,23 +88,40 @@ SHORT_RAW_CHARS = 80
 # models cannot silently drop the guardrails along with the model. It goes to
 # the rewriter on *stdin*, so `cmd` stays a plain filter and the transcript
 # never appears in `ps`.
-POLISH_PROMPT = """You reformat dictated text. You do not write it.
+POLISH_PROMPT = """You turn dictated speech into written text. You keep every idea; you never add one.
 
 Rules:
-1. Output ONLY the reformatted text. No preamble, no commentary, no code fences,
+1. Output ONLY the written text. No preamble, no commentary, no code fences,
    no quotes around the whole thing.
-2. Keep every word the speaker said, in the same order, with the same wording.
-   Do not add, remove, summarise or paraphrase.
-3. Delete only filler words (um, uh, er, like, you know), accidental word
-   repetitions, and abandoned false starts. Where the speaker corrects
-   themselves ("I mean", "no wait", "actually"), keep only the corrected version.
-4. Fix punctuation, capitalisation, the spelling of the glossary terms below,
-   and paragraph breaks. Start a new paragraph at a topic change. In mixed
-   Chinese/English text, put a single space between a Latin letter or digit and a
-   neighbouring CJK ideograph ("English test. 然后"); never next to full-width
-   punctuation (，。、！？), and add no other spaces.
-5. Never change names, product names, technical terms, numbers, dates, versions
-   or units.
+2. Keep everything the speaker meant, in the order they meant it. Never add a
+   fact, an opinion, an example or a heading nobody dictated, and never drop a
+   point, a caveat, a name or a number.
+3. Fix the *delivery*, not the content. Repair as much as it takes to make the
+   sentence read as written:
+   - delete filler words (um, uh, er, like, you know) and abandoned false starts;
+   - delete a repeated or restated phrase, including an emphatic one: "there is
+     no manual issuing, not even manual issuing" is one statement, not two;
+   - where the speaker corrects themselves -- "no wait", "I mean", "sorry",
+     "actually", "let me rephrase" -- keep only the corrected version and drop
+     the discarded one;
+   - where the words as spoken are garbled or ungrammatical ("hard to manage in
+     the with its lifecycle"), repair *that fragment only*: delete the broken
+     words and make the smallest change that restores it, leaving the rest of the
+     sentence word for word;
+   - split or join sentences as the writing needs, and add punctuation,
+     capitalisation and paragraph breaks at topic changes.
+4. Do NOT paraphrase for style. The wording, terminology and detail are the
+   speaker's: do not swap a word for a synonym, do not reword a phrase that is
+   already grammatical, do not reorder their points, do not merge two points
+   into one, and do not expand a short phrase into a longer one. Rule 3 is a
+   licence to repair, not to rewrite.
+5. Keep the language and script exactly as spoken. Never translate, not one word
+   or phrase: a Chinese sentence stays Chinese, an English one stays English,
+   and a mixed sentence keeps its mix. Never change names, product names,
+   technical terms, numbers, dates, versions or units, and use the glossary
+   spellings below. In mixed Chinese/English text, put a single space between a
+   Latin letter or digit and a neighbouring CJK ideograph ("English test. 然后");
+   never next to full-width punctuation (，。、！？), and add no other spaces.
 6. If you cannot follow these rules, or the text is already clean, output it
    unchanged.
 
@@ -282,6 +299,13 @@ def polish_ok(raw: str, out: str, glossary: list[str]) -> tuple[bool, str]:
     short = size_in < (SHORT_RAW_CHARS if chars else SHORT_RAW_WORDS)
     if not (0.45 if short else 0.70) <= ratio <= 1.25:
         return False, f"length ratio {ratio:.2f}"
+    # Language, before the short-circuit below: a Chinese sentence that comes back in
+    # English passes every other check with room to spare (measured: '我们用
+    # terraform 的 1.9 版本...' -> 'We use vault 1.18 for this demo.'), and a
+    # translation is a failure at any length.
+    cjk_in, cjk_out = len(CJK.findall(raw)), len(CJK.findall(out))
+    if cjk_in >= MIN_POLISH_CJK and cjk_out < cjk_in * 0.5:
+        return False, f"language changed: CJK characters {cjk_in} -> {cjk_out}"
     if short:
         # A retraction is allowed to delete the words it retracted, and at this
         # size that deletion is most of the sentence (measured: 25 -> 13 words;
@@ -1362,6 +1386,9 @@ def self_test() -> None:
     cn_out = "我们用 vault 的 1.18 版本，来做这个演示。"
     assert measures_in_chars(cn_in) and guard_size(cn_in, True) < SHORT_RAW_CHARS
     assert polish_ok(cn_in, cn_out, ["terraform", "vault"])[0], "a Chinese retraction"
+    # A rewrite must not translate: this is a real accepted-by-everything-else
+    # failure (the model turned the sentence above into English).
+    assert not polish_ok(cn_in, "We use vault 1.18 for this demo.", ["vault"])[0], "no translation"
     # ...and once it is long enough for the strict checks, a hotword split by the
     # Latin/CJK space the rewriter was asked to insert is still present.
     k8_in = "我们用K8s集群来做这个演示，然后把结果交给团队去评审一下这个流程，再看看有没有遗漏的地方。" * 2
