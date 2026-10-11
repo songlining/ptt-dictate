@@ -113,7 +113,7 @@ way what was captured is transcribed rather than discarded.
 | `--device` | system default | input device index or name |
 | `--no-double-tap` | off | no hands-free gesture: a press shorter than the window is transcribed at once instead of waiting to see whether it is half of a double-press |
 | `--double-tap-ms` | system | double-press window in ms; default is the system double-click interval, clamped to 300–700 |
-| `--polish-cmd` | `""` | rewrite the transcript through this command (stdin → stdout) — see below |
+| `--polish-cmd` | `""` | rewrite the transcript of a **hands-free (double-press)** dictation through this command (stdin → stdout) — see below. Hold-to-talk is always pasted as transcribed |
 | `--polish-timeout` | `6.0` | seconds before the rewriter is abandoned and the raw transcript pasted |
 | `--dry-run` | off | print the text instead of pasting it |
 | `--paste-delay` | `0.6` | seconds the transcript stays on the clipboard before the old one is restored |
@@ -163,7 +163,8 @@ say is unlikely to help.
 
 ## Rephrasing the transcript
 
-`--polish-cmd` pipes the finished transcript through any command that reads text
+`--polish-cmd` pipes the transcript of a **hands-free dictation** through any
+command that reads text
 on stdin and writes text on stdout, and pastes what comes back:
 
 ```bash
@@ -176,8 +177,15 @@ It fixes punctuation, capitalisation, filler words (`um`, false starts, repeated
 words) and sentence/paragraph breaks, and repairs mis-hearings with the hotwords
 list as a spelling glossary. Measured on this machine: 1.3–2.2s added to a
 100–200 word dictation, with the pill reading `polishing…` in the meantime.
-Anything under 8 words — or under 24 characters, since CJK is dense — is pasted
-straight through; there is nothing to gain there.
+Anything under 8 words **and** under 8 CJK characters is pasted straight through —
+Chinese has no spaces, so a short Chinese sentence counts as one "word", which is
+why the character count is there too. Nothing to gain from rewriting either.
+
+**It applies to the double-press gesture, not to hold-to-talk.** A hold is a
+sentence or two and goes in exactly as transcribed; the rewrite is for the long
+rambling passage you get from recording hands-free, and it costs 1.3–2.2s of
+latency that a quick hold should not pay. The consequence to know:
+`--no-double-tap` means no rewriting at all.
 
 Three things make it safe to leave on:
 

@@ -170,10 +170,10 @@ def test_streaming_round_trip():
     assert s.parts and s.text_so_far
 
 
-def test_polish_decides_what_gets_pasted():
-    """--polish-cmd's output is what is pasted when the rewrite is accepted; on a
-    rejection the raw transcript is pasted instead. `pt.polish` is stubbed here —
-    the guard and the subprocess plumbing are covered by --self-test."""
+def test_only_hands_free_dictation_is_rewritten():
+    """--polish-cmd applies to a double-press (hands-free) session only — a
+    hold-to-talk press is pasted exactly as transcribed. `pt.polish` is stubbed
+    here; the guard and the subprocess plumbing are covered by --self-test."""
     spy = PasteSpy()
     spy.install()
     real_polish = pt.polish
@@ -183,15 +183,24 @@ def test_polish_decides_what_gets_pasted():
         model = FakeModel(text=long_text)
         model.gate.set()  # transcribe returns at once; this test is about the paste
         rec = pt.Recorder(model, dry_run=False, prewarm=False, batch=True, polish_cmd="fake")
-        rec.press()
+
+        rec.press()  # a hold: pressed and released, never promoted to hands-free
         speak(rec.current)
         rec.release(0)
-        wait_until(lambda: not rec.busy, what="polished finish")
-        assert spy.texts == ["Polished: " + long_text], spy.texts
+        wait_until(lambda: not rec.busy, what="hold finish")
+        assert spy.texts == [long_text], spy.texts
+
+        rec.press()  # a double-press: promoted, so the rewrite applies
+        speak(rec.current)
+        rec.promote()
+        rec.release(0)
+        wait_until(lambda: not rec.busy, what="hands-free finish")
+        assert spy.texts[-1] == "Polished: " + long_text, spy.texts
 
         pt.polish = lambda text, cmd, glossary, timeout: (text, "glossary lost: ['x']")
         rec.press()
         speak(rec.current)
+        rec.promote()
         rec.release(0)
         wait_until(lambda: not rec.busy, what="rejected finish")
         assert spy.texts[-1] == long_text, spy.texts
@@ -213,6 +222,6 @@ if __name__ == "__main__":
     test_press_accepted_while_previous_session_finalizes()
     test_duplicate_release_finishes_once()
     test_streaming_round_trip()
-    test_polish_decides_what_gets_pasted()
+    test_only_hands_free_dictation_is_rewritten()
     test_release_with_nothing_recording_is_a_noop()
     print("lifecycle tests OK (5)")

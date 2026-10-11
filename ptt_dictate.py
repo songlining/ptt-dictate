@@ -931,13 +931,19 @@ class Session:
             self._step()
 
     def _polish(self, text: str) -> tuple[str, str]:
-        """Rewrite via --polish-cmd, or hand back the raw text untouched.
+        """Rewrite via --polish-cmd — **hands-free (double-press) sessions only**.
+
+        A hold-to-talk press is a sentence or two and is pasted exactly as
+        transcribed; the rewrite is the point of the double-press gesture, where
+        a long rambling passage benefits from punctuation and paragraph
+        structure. The consequence to know: `--no-double-tap` means no rewriting
+        at all.
 
         Short text is skipped outright: 'yes please' cannot be improved, and a
         rewrite would still cost ~1.5s of the paste.
         """
         rec = self.rec
-        if not rec.polish_cmd:
+        if not rec.polish_cmd or not self.toggled:
             return text, ""
         if len(text.split()) < MIN_POLISH_WORDS and len(CJK.findall(text)) < MIN_POLISH_CJK:
             return text, ""  # 'yes please' cannot be improved; a short Chinese
@@ -1314,13 +1320,17 @@ def self_test() -> None:
         "Nomad", "terraform", "vault"
     ]
 
-    # --polish-cmd plumbing: short text is skipped, a bad rewriter is rejected.
+    # --polish-cmd plumbing: hands-free only, short text skipped, a bad rewriter
+    # rejected.
     rec2 = Recorder(_FakeModel(), dry_run=True, prewarm=False, batch=True, polish_cmd="cat")
     sess3 = Session(rec2, 1)
+    long = "we set the ttl to sixty minutes and that is what we did in the demo"
+    out, note = sess3._polish(long)
+    assert (out, note) == (long, ""), "a hold-to-talk press is never rewritten"
+    sess3.toggled = True  # what Recorder.promote() sets for a double-press session
     assert sess3._polish("yes please") == ("yes please", ""), "short text must not be rewritten"
     assert sess3._polish("行，好的。") == ("行，好的。", ""), "5 characters is still too short"
     assert sess3._polish("我，呃，我不知道我这个形容的对不对。")[1], "a Chinese sentence must not skip"
-    long = "we set the ttl to sixty minutes and that is what we did in the demo"
     out, note = sess3._polish(long)
     assert out == long and note, (out, note)  # `cat` echoes the prompt: rejected
     # A trailing full stop is not a lost number; a missing number is.
@@ -1394,10 +1404,12 @@ def main() -> None:
                     help="double-press window in ms (0 = the system double-click interval,"
                          " clamped to 300-700)")
     ap.add_argument("--polish-cmd", default="",
-                    help="rewrite the transcript by piping it through this command"
-                         " (stdin -> stdout), e.g. pi -p -nt --no-session --no-skills"
-                         " --thinking off --model deepseek/deepseek-flash; the raw text is"
-                         " pasted unless the rewrite passes a safety check")
+                    help="rewrite the transcript of a hands-free (double-press) dictation by"
+                         " piping it through this command (stdin -> stdout), e.g. pi -p -nt"
+                         " --no-session --no-skills --thinking off --model"
+                         " deepseek/deepseek-flash; hold-to-talk is always pasted as"
+                         " transcribed, and the raw text is pasted unless the rewrite"
+                         " passes a safety check")
     ap.add_argument("--polish-timeout", type=float, default=6.0,
                     help="seconds before the rewriter is abandoned and the raw text pasted")
     ap.add_argument("--dry-run", action="store_true", help="print instead of pasting")
