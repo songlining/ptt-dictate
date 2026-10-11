@@ -100,7 +100,8 @@ sys.path.insert(0, sys.argv[2])
 import ptt_dictate as pt
 
 sample = ("so um we need to update the terraform version, no wait, actually we need to "
-          "update the vault version for the boundary demo on friday")
+          "update the vault version for the boundary demo on friday, "
+          "然后再说中文，这是中文的测试。")
 out, note = pt.polish(sample, sys.argv[1], pt.hotwords("", sys.argv[3]), 30.0)
 if note:
     sys.exit(f"rewriter rejected the sample: {note}")

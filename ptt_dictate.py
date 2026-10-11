@@ -57,18 +57,32 @@ SPEAKER = re.compile(r"\s*speaker\s*\d+\s*:\s*", re.I)
 METER_BARS = 5
 MIN_POLISH_WORDS = 8  # shorter than this a rewrite gains nothing and costs ~1.5s
 MIN_POLISH_CJK = 8  # Chinese has no spaces, and 8 characters is already a sentence
-CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+# Separate from the threshold above on purpose: this one picks the guard's ruler,
+# that one decides whether ~1.5s is worth spending on the call. Retuning one must
+# not silently move the other.
+UNIT_CJK_CHARS = 8
+# CJK ideographs and kana: scripts written without word separators, which is what
+# forces the character unit. CJK punctuation and full-width forms ride along (the
+# ideographic space is stripped as whitespace by the character count). Hangul is
+# deliberately absent — Korean separates words with spaces, so the word unit is
+# the right one there.
+CJK = re.compile(
+    r"[\u3001-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff01-\uff60]"
+    r"|[\U00020000-\U0002ebef]"
+)
 # A first line that is a *label* about the transcript rather than the dictation
 # (``Cleaned transcript: ...``). Only consulted for a line ending in a colon, so
 # a dictated "Note: ship it Friday" is left alone. English and Chinese, because
 # Chinese dictation is routine here (full-width colon included).
 META_WORDS = ("transcript", "cleaned", "polished", "rewritten", "processed",
               "以下", "润色", "如下", "转录")
-# Below this length a dictation can legitimately *halve* itself by correcting
-# itself ("the Terraform version, no wait, the Vault version"), so the guard
-# stops asking for every number and hotword to survive and checks only that the
-# rewrite did not balloon or collapse.
+# Below this size a dictation can legitimately *halve* itself by correcting
+# itself ("the Terraform version, no wait, the Vault version"), so the guard stops
+# asking for every number and hotword to survive and checks only that the rewrite
+# did not balloon or collapse. Two numbers because the units are not comparable:
+# 40 words is ~200 characters, so Chinese gets the same benefit of the doubt at 80.
 SHORT_RAW_WORDS = 40
+SHORT_RAW_CHARS = 80
 
 # The rewrite prompt lives here rather than in --polish-cmd so that swapping
 # models cannot silently drop the guardrails along with the model. It goes to
@@ -85,7 +99,10 @@ Rules:
    repetitions, and abandoned false starts. Where the speaker corrects
    themselves ("I mean", "no wait", "actually"), keep only the corrected version.
 4. Fix punctuation, capitalisation, the spelling of the glossary terms below,
-   and paragraph breaks. Start a new paragraph at a topic change.
+   and paragraph breaks. Start a new paragraph at a topic change. In mixed
+   Chinese/English text, put a single space between a Latin letter or digit and a
+   neighbouring CJK ideograph ("English test. 然后"); never next to full-width
+   punctuation (，。、！？), and add no other spaces.
 5. Never change names, product names, technical terms, numbers, dates, versions
    or units.
 6. If you cannot follow these rules, or the text is already clean, output it
@@ -194,6 +211,29 @@ def hotwords(context: str = "", context_file: str = "") -> list[str]:
     return _dedupe(words)
 
 
+def measures_in_chars(text: str) -> bool:
+    """Whether the guard should measure `text` in characters rather than words."""
+    return len(CJK.findall(text)) >= UNIT_CJK_CHARS
+
+
+def guard_size(text: str, chars: bool) -> int:
+    """`text`'s length in the guard's unit.
+
+    Whitespace words are meaningless in Chinese — "那行，那咱们就测试一下" is one
+    word — and a *correct* rewrite moves that count twice over: deleting a filler
+    merges nothing, and inserting the conventional space between Latin and CJK
+    splits a token. Measured on a real mixed sentence, 7 words became 9, read as
+    +29% growth, and the rewrite was thrown away.
+
+    `chars` is passed in rather than detected per text: a rewrite that drops below
+    the CJK threshold would otherwise be measured in words against a raw measured
+    in characters (8 CJK characters in, 7 out, is 0.93 in characters and 0.20 as
+    that bug saw it). Whitespace is ignored in both units, so the space the
+    rewriter is *asked* to insert can never move the number.
+    """
+    return len(re.sub(r"\s+", "", text)) if chars else len(text.split())
+
+
 def build_polish_prompt(text: str, glossary: list[str]) -> str:
     return POLISH_PROMPT.format(glossary=", ".join(glossary) or "(none)", text=text)
 
@@ -234,18 +274,20 @@ def polish_ok(raw: str, out: str, glossary: list[str]) -> tuple[bool, str]:
         # Chatter, not the dictation. Kept narrow on purpose: "Of course we can"
         # is a legitimate thing to dictate, "Here is the cleaned text:" is not.
         return False, "preamble or fence"
-    words_in, words_out = len(raw.split()), len(out.split())
-    if not words_in or not words_out:
+    chars = measures_in_chars(raw)  # one ruler for both sides, chosen by the raw
+    size_in, size_out = guard_size(raw, chars), guard_size(out, chars)
+    if not size_in or not size_out:
         return False, "unusable"
-    ratio = words_out / words_in
-    short = words_in < SHORT_RAW_WORDS
+    ratio = size_out / size_in
+    short = size_in < (SHORT_RAW_CHARS if chars else SHORT_RAW_WORDS)
     if not (0.45 if short else 0.70) <= ratio <= 1.25:
         return False, f"length ratio {ratio:.2f}"
     if short:
         # A retraction is allowed to delete the words it retracted, and at this
-        # length that deletion is most of the sentence (measured: 25 -> 13
-        # words). Nothing subtler than the ratio can be checked for text this
-        # small without rejecting honest edits.
+        # size that deletion is most of the sentence (measured: 25 -> 13 words;
+        # and a Chinese retraction at 43 -> 23 characters). Nothing subtler than
+        # the ratio can be checked for text this small without rejecting honest
+        # edits.
         return True, ""
     num = re.compile(r"\d[\d.,:/%-]*")
 
@@ -257,8 +299,17 @@ def polish_ok(raw: str, out: str, glossary: list[str]) -> tuple[bool, str]:
     if lost := amounts(raw) - amounts(out):
         return False, f"numbers lost: {sorted(lost)}"
     # Presence, not case: the model is *asked* to fix case (`boundary` ->
-    # `Boundary`), so only a term that vanished entirely is a failure.
-    if gone := [t for t in glossary if t.lower() in raw.lower() and t.lower() not in out.lower()]:
+    # `Boundary`), so only a term that vanished entirely is a failure. Compared
+    # with whitespace removed, because the rewriter is also asked to put a space
+    # between Latin and CJK — which would split a mixed-script term like `K8s集群`
+    # and read as a lost hotword.
+    squashed_in, squashed_out = (re.sub(r"\s+", "", raw).lower(), re.sub(r"\s+", "", out).lower())
+    gone = []
+    for term in glossary:
+        squashed = re.sub(r"\s+", "", term).lower()
+        if squashed and squashed in squashed_in and squashed not in squashed_out:
+            gone.append(term)
+    if gone:
         return False, f"glossary lost: {gone}"
     return True, ""
 
@@ -1250,7 +1301,7 @@ def self_test() -> None:
     # Past that length, every number and every hotword has to survive.
     raw = (short_raw + ", and then we hand the same thing to the customer team so they can review"
            " it before the workshop on Friday and come back with questions about the flow next week")
-    assert len(raw.split()) >= SHORT_RAW_WORDS, len(raw.split())
+    assert guard_size(raw, False) >= SHORT_RAW_WORDS, guard_size(raw, False)
     assert polish_ok(raw, raw[0].upper() + raw[1:] + ".", gloss)[0]
     assert not polish_ok(raw, raw.replace("1.21.3", ""), gloss)[0]  # a number went missing
     assert not polish_ok(raw, raw.replace("Vault Radar", "the tool"), gloss)[0]  # a hotword went missing
@@ -1279,6 +1330,35 @@ def self_test() -> None:
     assert not polish_ok("we set it", "Cleaned transcript: we set it.", [])[0]
     assert polish_ok("note: we ship it friday", "Note: we ship it Friday.", [])[0]  # not a label
     assert not polish_ok("we set it", "以下是润色后的文本：我们设置它。", [])[0]  # Chinese label
+    # Regression: a Chinese sentence's whitespace "words" are meaningless, so
+    # deleting a filler and adding a Latin/CJK space read as +29% growth and this
+    # correct rewrite (measured, real output) was rejected.
+    mixed_in = ("那行，那咱们就测试一下，好吧。行，呃，我先说英文，so this is English."
+                "呃，this is English test.然后再说中文，这是中文的测试。")
+    mixed_out = ("那行，那咱们就测试一下，好吧。行，我先说英文，so this is English."
+                 " This is English test. 然后再说中文，这是中文的测试。")
+    assert polish_ok(mixed_in, mixed_out, [])[0], "Chinese must be measured in characters"
+    assert not polish_ok(mixed_in, mixed_out[:20], [])[0], "characters, but still bounded"
+    # The ruler is chosen once, from the *raw*: 8 CJK characters in, 7 out. Picking
+    # it per text compared characters against words here and would reject this
+    # honest rewrite (0.93 in characters; 0.20 as that bug measured it).
+    cross_in, cross_out = "我们用这个工具做 the demo", "我们用这个工具 the demo"
+    assert measures_in_chars(cross_in) and not measures_in_chars(cross_out)
+    assert polish_ok(cross_in, cross_out, [])[0], "the guard's unit must come from the raw text"
+    # A Chinese retraction below the character threshold keeps the loose treatment,
+    # so deleting the number and hotword *inside the retracted clause* is not a
+    # rejection (43 -> 23 characters).
+    cn_in = "我们用 terraform 的 1.9 版本，不对，用 vault 的 1.18 版本，来做这个演示。"
+    cn_out = "我们用 vault 的 1.18 版本，来做这个演示。"
+    assert measures_in_chars(cn_in) and guard_size(cn_in, True) < SHORT_RAW_CHARS
+    assert polish_ok(cn_in, cn_out, ["terraform", "vault"])[0], "a Chinese retraction"
+    # ...and once it is long enough for the strict checks, a hotword split by the
+    # Latin/CJK space the rewriter was asked to insert is still present.
+    k8_in = "我们用K8s集群来做这个演示，然后把结果交给团队去评审一下这个流程，再看看有没有遗漏的地方。" * 2
+    k8_out = "我们用 K8s 集群来做这个演示，然后把结果交给团队去评审一下这个流程，再看看有没有遗漏的地方。" * 2
+    assert guard_size(k8_in, True) >= SHORT_RAW_CHARS, guard_size(k8_in, True)
+    assert polish_ok(k8_in, k8_out, ["K8s集群", "Kubernetes"])[0], "a spaced term is still present"
+    assert not polish_ok(k8_in, k8_out.replace("K8s 集群", "集群"), ["K8s集群"])[0], "a lost term is not"
     # A rewriter that fails or hangs is rejected, and pasting still happens.
     assert polish(long, "exit 7", [], 5)[1].startswith("exit 7")
     out, note = polish(long, "sleep 30", [], 0.5)
