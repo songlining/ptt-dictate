@@ -59,8 +59,15 @@ MIN_POLISH_WORDS = 8  # shorter than this a rewrite gains nothing and costs ~1.5
 MIN_POLISH_CHARS = 24  # ...and CJK has no spaces, so words alone would skip it
 # A first line that is a *label* about the transcript rather than the dictation
 # (``Cleaned transcript: ...``). Only consulted for a line ending in a colon, so
-# a dictated "Note: ship it Friday" is left alone.
-META_WORDS = ("transcript", "cleaned", "polished", "rewritten", "processed")
+# a dictated "Note: ship it Friday" is left alone. English and Chinese, because
+# Chinese dictation is routine here (full-width colon included).
+META_WORDS = ("transcript", "cleaned", "polished", "rewritten", "processed",
+              "以下", "润色", "如下", "转录")
+# Below this length a dictation can legitimately *halve* itself by correcting
+# itself ("the Terraform version, no wait, the Vault version"), so the guard
+# stops asking for every number and hotword to survive and checks only that the
+# rewrite did not balloon or collapse.
+SHORT_RAW_WORDS = 40
 
 # The rewrite prompt lives here rather than in --polish-cmd so that swapping
 # models cannot silently drop the guardrails along with the model. It goes to
@@ -221,7 +228,7 @@ def polish_ok(raw: str, out: str, glossary: list[str]) -> tuple[bool, str]:
         or "**" in out
         or first.startswith(("here is", "here's", "below is"))
         or "cleaned text" in first
-        or (first.endswith(":") and any(w in first for w in META_WORDS))
+        or (first.endswith((":", "：")) and any(w in first for w in META_WORDS))
     ):
         # Chatter, not the dictation. Kept narrow on purpose: "Of course we can"
         # is a legitimate thing to dictate, "Here is the cleaned text:" is not.
@@ -230,11 +237,15 @@ def polish_ok(raw: str, out: str, glossary: list[str]) -> tuple[bool, str]:
     if not words_in or not words_out:
         return False, "unusable"
     ratio = words_out / words_in
-    if not 0.55 <= ratio <= 1.25:
-        # Loose on the low side: deleting fillers and false starts is the job, so
-        # an honest rewrite of disfluent speech is short. A dropped *clause* is
-        # caught by the numbers/glossary checks below, which do not trade off.
+    short = words_in < SHORT_RAW_WORDS
+    if not (0.45 if short else 0.70) <= ratio <= 1.25:
         return False, f"length ratio {ratio:.2f}"
+    if short:
+        # A retraction is allowed to delete the words it retracted, and at this
+        # length that deletion is most of the sentence (measured: 25 -> 13
+        # words). Nothing subtler than the ratio can be checked for text this
+        # small without rejecting honest edits.
+        return True, ""
     num = re.compile(r"\d[\d.,:/%-]*")
 
     def amounts(s: str) -> set[str]:
@@ -1220,14 +1231,25 @@ def self_test() -> None:
 
     # The rewrite guard: honest edits pass, anything that loses text does not.
     gloss = ["Vault Radar", "Boundary"]
-    raw = "we use Vault Radar with Boundary and 1.21.3 for that"
-    assert polish_ok(raw, "We use Vault Radar with Boundary and 1.21.3 for that.", gloss) == (True, "")
-    assert polish_ok(raw, "We use Vault Radar with Boundary and 1.21.3", gloss)[0]  # 0.9, fine
-    assert not polish_ok(raw, "Use Vault Radar.", gloss)[0]  # content dropped
-    assert not polish_ok(raw, "We use Vault Radar with Boundary for that", gloss)[0]  # 1.21.3 lost
-    assert not polish_ok(raw, "We use the tool with Boundary and 1.21.3 for that", gloss)[0]  # term lost
-    assert not polish_ok(raw, "Here is the cleaned text: " + raw, gloss)[0]  # preamble
-    assert not polish_ok(raw, "   ", gloss)[0]  # empty
+    short_raw = "we use Vault Radar with Boundary and 1.21.3 for that"
+    assert polish_ok(short_raw, "We use Vault Radar with Boundary and 1.21.3 for that.", gloss)[0]
+    assert not polish_ok(short_raw, "Use Vault Radar.", gloss)[0]  # collapsed
+    # A retraction may delete the clause it retracted: 25 -> 13 words is a real
+    # accepted rewrite, measured on this machine.
+    retracted = ("So um, we need to update the Terraform version. No wait, actually we need to "
+                 "update the Vault version for the boundary demo on Friday.")
+    assert polish_ok(
+        retracted, "We need to update the Vault version for the boundary demo on Friday.", gloss
+    )[0], "a self-correction must not be rejected"
+    # Past that length, every number and every hotword has to survive.
+    raw = (short_raw + ", and then we hand the same thing to the customer team so they can review"
+           " it before the workshop on Friday and come back with questions about the flow next week")
+    assert len(raw.split()) >= SHORT_RAW_WORDS, len(raw.split())
+    assert polish_ok(raw, raw[0].upper() + raw[1:] + ".", gloss)[0]
+    assert not polish_ok(raw, raw.replace("1.21.3", ""), gloss)[0]  # a number went missing
+    assert not polish_ok(raw, raw.replace("Vault Radar", "the tool"), gloss)[0]  # a hotword went missing
+    assert not polish_ok(short_raw, "Here is the cleaned text: " + short_raw, gloss)[0]  # preamble
+    assert not polish_ok(short_raw, "   ", gloss)[0]  # empty
     prompt = build_polish_prompt("hello there", gloss)
     assert "hello there" in prompt and "Vault Radar" in prompt, prompt
     # A lower-case hotword must not demote a name the text already capitalised.
@@ -1248,6 +1270,7 @@ def self_test() -> None:
     assert not polish_ok("we set it", "**Cleaned transcript:** we set it.", [])[0]
     assert not polish_ok("we set it", "Cleaned transcript: we set it.", [])[0]
     assert polish_ok("note: we ship it friday", "Note: we ship it Friday.", [])[0]  # not a label
+    assert not polish_ok("we set it", "以下是润色后的文本：我们设置它。", [])[0]  # Chinese label
     # A rewriter that fails or hangs is rejected, and pasting still happens.
     assert polish(long, "exit 7", [], 5)[1].startswith("exit 7")
     out, note = polish(long, "sleep 30", [], 0.5)

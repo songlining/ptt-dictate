@@ -184,12 +184,16 @@ Three things make it safe to leave on:
 - **The transcript never reaches the command line.** It goes in on stdin, so it
   is not visible in `ps`, and `--polish-cmd` is the single knob that decides
   where it goes.
-- **A rewrite is only a candidate.** To be pasted it must still contain every
-  number and every hotword the transcript had, sit within 0.55–1.25× its length,
-  and not open with `Here is…`. Anything else — a dropped clause, a timeout, a
-  non-zero exit — is logged as `(polish skipped: <reason>)` and the raw
-  transcript is pasted instead. Every model tried got something wrong on real
-  dictation, so the guard is what makes this safe, not the choice of model.
+- **A rewrite is only a candidate.** It is pasted only if it still contains
+  every number and every hotword the transcript had, sits within 0.70–1.25× its
+  length, and does not open with `Here is…`. Under 40 words only the length is
+  checked: "the Terraform version, no wait, the Vault version" is 25 words in
+  and 13 out, so a retraction has to be allowed to delete what it retracted
+  (measured — that rewrite is correct, and the first version of this guard
+  rejected it). Anything else — a dropped clause, a timeout, a non-zero exit —
+  is logged as `(polish skipped: <reason>)` and the raw transcript is pasted
+  instead. Every model tried got something wrong on real dictation, so the guard
+  is what makes this safe, not the choice of model.
 - **The rules travel with the code.** The prompt (rules + glossary) lives in
   `ptt_dictate.py` and is sent on stdin ahead of the text, so swapping `--model`
   cannot quietly drop the guardrails. A lower-case entry in `hotwords.txt`
