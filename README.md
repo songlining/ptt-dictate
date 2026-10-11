@@ -205,6 +205,13 @@ customer names, versions, architecture talk. That is why the default is off, and
 why a local rewriter (`ollama run …`, a local MLX model) needs no code at all:
 same interface, different `--polish-cmd`.
 
+`install.sh` runs that command **once, at install time, from a launchd-like
+environment** (one real call, on a sample sentence). If it cannot run — missing
+binary, bad model id, expired credentials — you are told before the daemon goes
+live instead of discovering it as a silent fallback to raw text on every
+dictation. The daemon's `PATH` is the one install.sh wrote into the plist, which
+is why a command that works in your shell works there too.
+
 Known limit: two dictations in quick succession paste in whichever order their
 *rewrites* finish — transcribes are serialised behind one lock, rewrites are not,
 and that is a wider window than it used to be.

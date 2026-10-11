@@ -79,6 +79,42 @@ mkdir -p "$(dirname "$LOG")"
 } > "$PLIST"
 
 plutil -lint "$PLIST" >/dev/null
+
+# Validate the rewriter now, once, from a launchd-like environment — the daemon
+# inherits launchd's PATH, so a --polish-cmd that works in this shell can still
+# come back "command not found" at dictation time, one silent fallback at a
+# time. This is one real (tiny) call: it proves the command resolves, that the
+# model and its credentials work, and that the rewrite passes the guard. A
+# failure here does not stop the install — dictation keeps working with the raw
+# transcript — but you are told about it before it goes live.
+polish_cmd=; prev=
+for a in "$@"; do
+  [[ "$prev" == "--polish-cmd" ]] && polish_cmd="$a"
+  prev="$a"
+done
+if [[ -n "$polish_cmd" ]]; then
+  echo "checking the rewriter (one real call) ..."
+  if env -i HOME="$HOME" PATH="$PATH" "$PYTHON" - "$polish_cmd" "$REPO" "$HOTWORDS" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[2])
+import ptt_dictate as pt
+
+sample = ("so um we need to update the terraform version, no wait, actually we need to "
+          "update the vault version for the boundary demo on friday")
+out, note = pt.polish(sample, sys.argv[1], pt.hotwords("", sys.argv[3]), 30.0)
+if note:
+    sys.exit(f"rewriter rejected the sample: {note}")
+print(f"rewriter OK: {out}")
+PY
+  then :
+  else
+    echo "! the rewriter cannot run from a launchd-like environment." >&2
+    echo "  Every dictation will paste the raw transcript. If the command uses a" >&2
+    echo "  binary from your PATH (node, bun, ollama), check the PATH written into" >&2
+    echo "  $PLIST." >&2
+  fi
+fi
+
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 
 # bootout is asynchronous, and bootstrapping the label too soon fails with
