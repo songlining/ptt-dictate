@@ -61,6 +61,13 @@ mkdir -p "$(dirname "$LOG")"
     echo "    <string>$arg</string>"
   done
   echo '  </array>'
+  # launchd's PATH is /usr/bin:/bin:/usr/sbin:/sbin, which finds neither node nor
+  # a --polish-cmd like `pi` (a `#!/usr/bin/env node` script) — a rewriter that
+  # works in your shell would come back "command not found" in the daemon. Bake
+  # the invoking shell's PATH into the plist. plutil -lint below catches a PATH
+  # that would break the XML, before anything is torn down.
+  echo '  <key>EnvironmentVariables</key><dict><key>PATH</key>'
+  echo "    <string>$PATH</string></dict>"
   echo '  <key>RunAtLoad</key><true/>'
   echo '  <key>KeepAlive</key><true/>'
   # latency-sensitive: keep it out of App Nap / background QoS throttling
